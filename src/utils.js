@@ -19,13 +19,17 @@ function appendSection(previousText, text) {
  * @returns {boolean}
  */
 function validateDate(value) {
-    const date = dayjs(value, "D/M");
-    
-    if (value.match(/^\d{1,2}\/\d{1,2}$/) == null) {
+    const match = value.match(/^(\d{1,2})\/(\d{1,2})(?:\/(\d{4}))?$/);
+
+    if (match == null) {
         return false;
     }
 
-    const [day, month] = value.split("/");
+    const day = match[1];
+    const month = match[2];
+    const year = match[3] || (new Date()).getFullYear().toString();
+    const date = dayjs(`${day}/${month}/${year}`, "D/M/Y");
+
     const internalDay = date.date();
     const internalMonth = date.month();
 
