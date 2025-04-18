@@ -71,7 +71,11 @@ function validateTime(value) {
  * @returns {string}
  */
 function formatDatetime(value) {
-    const date = dayjs(value, "D/M H:m");
+    let date = dayjs(value, "D/M/Y H:m");
+
+    if (!date.isValid()) {
+        date = dayjs(value, "D/M H:m");
+    }
 
     return date.format("DD/MM/YYYY HH:mm");
 }
