@@ -4,6 +4,26 @@ import { REST, Routes, ApplicationCommandOptionType } from "discord.js";
 dotenv.config();
 
 const commands = [
+   
+    {
+        name: 'track',
+        description: 'Começa a monitorar uma partida de osu!',
+        options: [
+            {
+                name: 'id',
+                description: 'O ID da partida (os números no fim do link)',
+                type: 4, 
+                required: true,
+            },
+            {
+                name: 'best_of',
+                description: 'Ex. bo9, bo11, bo13..',
+                type: 4, 
+                required: true,
+            },
+        ],
+    },
+   
     {
         name: "reschedule",
         description: "Remarcar partida",
@@ -15,11 +35,17 @@ const commands = [
                 required: true,
             },
             {
+                name: "id",
+                description: "ID da sua match (exemplo: 14)",
+                type: ApplicationCommandOptionType.Integer,
+                required: true,
+            },           
+            {
                 name: "data",
                 description: "dia da partida (use por exemplo, 03/04)",
                 type: ApplicationCommandOptionType.String,
                 required: true,
-            },
+            }, 
             {
                 name: "horário",
                 description: "Horário(use por exemplo, 15:00)",
