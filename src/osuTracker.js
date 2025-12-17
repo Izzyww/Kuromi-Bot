@@ -175,14 +175,14 @@ bancho.on("CM", async (message) => {
                 embed.addFields(
                     { 
                         name: '🏁 Placar', 
-                        value: `🔴 **${matchState.scoreRed}** —  **${matchState.scoreBlue}** 🔵`, 
+                        value: `🔴 ${redNameLabel} **${matchState.scoreRed}** — **${matchState.scoreBlue}** ${blueNameLabel} 🔵`, 
                         inline: false 
                     },
-                    { name: `🔴 ${redNameLabel}`, value: redScore.toLocaleString(), inline: true },
-                    { name: `🔵 ${blueNameLabel}`, value: blueScore.toLocaleString(), inline: true },
+                    { name: `${redNameLabel}`, value: redScore.toLocaleString(), inline: true },
+                    { name: `${blueNameLabel}`, value: blueScore.toLocaleString(), inline: true },
                     { name: 'Diferença', value: Math.abs(redScore - blueScore).toLocaleString(), inline: true },
                     { 
-                        name: '🌟 Vencedor', 
+                        name: '🌟 Vencedor  ', 
                         value: `:flag_${mvpData.user.country}: **${mvpData.user.name}** com ${mvpData.points.toLocaleString()} pontos`, 
                         inline: false 
                     }
@@ -214,10 +214,8 @@ bancho.on("CM", async (message) => {
                     await channel.leave(); // Sai do IRC
                     activeMatches.delete(channelName); // Apaga da memória
                     
-                    // Avisa no chat que parou de monitorar
-                    await matchState.discordChannel.send(`🛑 **Fim de jogo!** Deixando de monitorar a sala MP ${matchState.matchId}.`);
                     console.log(`🏁 Partida ${matchState.matchId} finalizada. Bot desconectado.`);
-                }
+                }   
 
             } catch (err) {
                 console.error("Erro ao enviar embed:", err);
