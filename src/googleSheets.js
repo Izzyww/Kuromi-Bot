@@ -711,6 +711,7 @@ export async function setupStandingsFormulas() {
     const pfCol      = "AD";
     const paCol      = "AE";
     const pdCol      = "AF";
+    const seedCol    = "AG";
 
     const sheets = getSheetsClient();
 
@@ -744,35 +745,46 @@ export async function setupStandingsFormulas() {
     const irS1 = ir(sourceS1Col);
     const irS2 = ir(sourceS2Col);
 
-    const updates = [];
-    const pdCellRanges = []; // sheet-row ranges to number-format
+    // Capture each group's current player names (col AA = idx 23 within D:AG)
+    // and seeds (col AG = idx 29) BEFORE we clear the cells — these become
+    // constants inside the sort formula so players stay tied to their seeds.
+    const escapeLit = (s) => `"${String(s).replace(/"/g, '""')}"`;
+    const groupDetails = groups.map((g) => {
+        const players = [];
+        const seeds = [];
+        for (let i = 0; i < 4; i++) {
+            const row = rows[g.startIndex + i] || [];
+            const name = String(row[23] || "").trim();
+            const seedRaw = String(row[29] || "").trim();
+            const seedNum = parseInt(seedRaw.replace(/^#/, ""), 10);
+            players.push(name);
+            seeds.push(Number.isFinite(seedNum) ? seedNum : 99);
+        }
+        return { ...g, players, seeds };
+    });
 
-    for (const { letter, startIndex } of groups) {
+    const updates = [];
+    const pdCellRanges = [];      // sheet-row ranges to number-format (PD)
+    const highlightRanges = [];   // sheet-row ranges for top-2 pink highlight
+
+    for (const { letter, startIndex, players, seeds } of groupDetails) {
         const startRow = startIndex + 1;
-        pdCellRanges.push({ startRow, endRow: startRow + 4 }); // 4 standings rows
+        pdCellRanges.push({ startRow, endRow: startRow + 4 });
+        highlightRanges.push({ startRow, endRow: startRow + 2 }); // top 2 rows
 
         // ── SCORE COLUMNS N / O ────────────────────────────────────────────
-        // For every match row, look up the Schedule row whose player names
-        // match this row's M and P (both orderings accepted), pull scores.
-        // Wrapped in IFNA→VALUE so results are always proper numbers (text
-        // returned by FILTER would break numeric comparisons downstream).
         for (let offset = 0; offset < 6; offset++) {
             const r = startRow + offset;
             const lobby = String(rows[startIndex + offset]?.[3] || "").trim();
             if (!lobby) continue;
 
-            const pl1 = `${player1Col}${r}`; // e.g. M38
-            const pl2 = `${player2Col}${r}`; // e.g. P38
+            const pl1 = `${player1Col}${r}`;
+            const pl2 = `${player2Col}${r}`;
 
-            // IFERROR (not IFNA) on outer layer: VALUE("") returns #VALUE!,
-            // not #N/A, and we want a 0 in either case. Inner IFNA catches
-            // "no matching row" from FILTER; VALUE forces a numeric result
-            // so downstream comparisons (N>=5) don't get fooled by text.
             const lookupT1 =
                 `IFERROR(VALUE(IFNA(` +
                 `FILTER(${irS1},${irP1}=${pl1},${irP2}=${pl2}),` +
                 `FILTER(${irS2},${irP1}=${pl2},${irP2}=${pl1}))),0)`;
-
             const lookupT2 =
                 `IFERROR(VALUE(IFNA(` +
                 `FILTER(${irS2},${irP1}=${pl1},${irP2}=${pl2}),` +
@@ -784,48 +796,64 @@ export async function setupStandingsFormulas() {
             });
         }
 
-        // ── STANDINGS COLUMNS AB–AF and Z ──────────────────────────────────
-        // Using COUNTIFS/SUMIFS (strict numeric comparisons, skips non-numbers)
-        // instead of SUMPRODUCT (returns truthy for text >= number comparisons).
+        // ── STANDINGS (auto-sorted spill formula at Z{startRow}) ───────────
+        // Produces a 4x8 table that spills into Z:AG, sorted by
+        // wins desc → PD desc → PF desc → seed asc. Ties share the same
+        // rank label so e.g. two tied players both show "#2".
         const m = `${player1Col}${startRow}:${player1Col}${startRow + 5}`;
         const p = `${player2Col}${startRow}:${player2Col}${startRow + 5}`;
         const n = `${score1Col}${startRow}:${score1Col}${startRow + 5}`;
         const o = `${score2Col}${startRow}:${score2Col}${startRow + 5}`;
 
-        const winsRange = `${winsCol}${startRow}:${winsCol}${startRow + 3}`;
-        const pdRange   = `${pdCol}${startRow}:${pdCol}${startRow + 3}`;
-        const pfRange   = `${pfCol}${startRow}:${pfCol}${startRow + 3}`;
+        const PL = `{${players.map(escapeLit).join(";")}}`; // column vector, semicolons
+        const SD = `{${seeds.join(";")}}`;
 
-        for (let offset = 0; offset < 4; offset++) {
-            const r  = startRow + offset;
-            const pl = `${playerCol}${r}`;
-            const emptyGuard = `IF(${pl}="",0,`;
+        const spill =
+            `=LET(` +
+            `M_,${m},` +
+            `P_,${p},` +
+            `N_,${n},` +
+            `O_,${o},` +
+            `PL,${PL},` +
+            `SD,${SD},` +
+            `WN,MAP(PL,LAMBDA(pn,COUNTIFS(M_,pn,N_,">=5")+COUNTIFS(P_,pn,O_,">=5"))),` +
+            `LS,MAP(PL,LAMBDA(pn,COUNTIFS(M_,pn,O_,">=5")+COUNTIFS(P_,pn,N_,">=5"))),` +
+            `PFS,MAP(PL,LAMBDA(pn,SUMIF(M_,pn,N_)+SUMIF(P_,pn,O_))),` +
+            `PAS,MAP(PL,LAMBDA(pn,SUMIF(M_,pn,O_)+SUMIF(P_,pn,N_))),` +
+            // Compute PD directly with MAP. Doing `PFS-PAS` across two
+            // LET-bound MAP results doesn't reliably produce an array — it
+            // collapses to a scalar and HSTACK pads the column with #N/A,
+            // which then poisons the sort's PD tiebreaker and breaks ranks.
+            `PDS,MAP(PL,LAMBDA(pn,SUMIF(M_,pn,N_)+SUMIF(P_,pn,O_)-SUMIF(M_,pn,O_)-SUMIF(P_,pn,N_))),` +
+            `TBL,HSTACK(PL,WN,LS,PFS,PAS,PDS,SD),` +
+            `ST,SORT(TBL,2,FALSE,6,FALSE,4,FALSE,7,TRUE),` +
+            `SW,INDEX(ST,0,2),SPD,INDEX(ST,0,6),SPF,INDEX(ST,0,4),` +
+            `RK,MAP(SEQUENCE(4),LAMBDA(k,"#"&(1` +
+            `+COUNTIF(SW,">"&INDEX(SW,k))` +
+            `+COUNTIFS(SW,"="&INDEX(SW,k),SPD,">"&INDEX(SPD,k))` +
+            `+COUNTIFS(SW,"="&INDEX(SW,k),SPD,"="&INDEX(SPD,k),SPF,">"&INDEX(SPF,k))` +
+            `))),` +
+            `SL,MAP(INDEX(ST,0,7),LAMBDA(s,"#"&s)),` +
+            `HSTACK(RK,INDEX(ST,0,1),INDEX(ST,0,2),INDEX(ST,0,3),INDEX(ST,0,4),INDEX(ST,0,5),INDEX(ST,0,6),SL))`;
 
-            const wins   = `=${emptyGuard}COUNTIFS(${m},${pl},${n},">=5")+COUNTIFS(${p},${pl},${o},">=5"))`;
-            const losses = `=${emptyGuard}COUNTIFS(${m},${pl},${o},">=5")+COUNTIFS(${p},${pl},${n},">=5"))`;
-            const pf     = `=${emptyGuard}SUMIF(${m},${pl},${n})+SUMIF(${p},${pl},${o}))`;
-            const pa     = `=${emptyGuard}SUMIF(${m},${pl},${o})+SUMIF(${p},${pl},${n}))`;
-            const pd     = `=${pfCol}${r}-${paCol}${r}`;
+        updates.push({
+            range: `${sheetName}!${rankCol}${startRow}`,
+            values: [[spill]],
+        });
 
-            // Rank: 1 + (players with strictly better wins, then PD, then PF)
-            const rank = `=IF(${pl}="","","#"&(1`
-                + `+COUNTIF(${winsRange},">"&${winsCol}${r})`
-                + `+COUNTIFS(${winsRange},"="&${winsCol}${r},${pdRange},">"&${pdCol}${r})`
-                + `+COUNTIFS(${winsRange},"="&${winsCol}${r},${pdRange},"="&${pdCol}${r},${pfRange},">"&${pfCol}${r})))`;
-
-            updates.push({
-                range: `${sheetName}!${winsCol}${r}:${pdCol}${r}`,
-                values: [[wins, losses, pf, pa, pd]],
-            });
-            updates.push({
-                range: `${sheetName}!${rankCol}${r}`,
-                values: [[rank]],
-            });
-        }
-
-        console.log(`✅ Group ${letter}: formulas queued for rows ${startRow}–${startRow + 5}.`);
+        console.log(`✅ Group ${letter}: sort formula queued at ${rankCol}${startRow} (spills into Z:AG).`);
     }
 
+    // ── STEP 1: clear old standings content so the spill formulas don't collide.
+    const clearRanges = groupDetails.map(
+        (g) => `${sheetName}!${rankCol}${g.startIndex + 1}:${seedCol}${g.startIndex + 4}`
+    );
+    await sheets.spreadsheets.values.batchClear({
+        spreadsheetId,
+        requestBody: { ranges: clearRanges },
+    });
+
+    // ── STEP 2: write score formulas (N/O) and spill formulas (Z).
     await sheets.spreadsheets.values.batchUpdate({
         spreadsheetId,
         requestBody: {
@@ -834,40 +862,76 @@ export async function setupStandingsFormulas() {
         },
     });
 
-    // Apply "+"-prefix number format to PD cells (values stay numeric so the
-    // rank tiebreaker COUNTIFS still compares correctly).
+    // ── STEP 3: PD "+" number format + top-2 pink highlight.
     try {
         const meta = await sheets.spreadsheets.get({ spreadsheetId });
         const tab = meta.data.sheets?.find((s) => s.properties?.title === sheetName);
         const sheetId = tab?.properties?.sheetId;
 
-        if (sheetId != null && pdCellRanges.length > 0) {
-            const colIdx = pdCol.split("").reduce((acc, c) => acc * 26 + (c.charCodeAt(0) - 64), 0) - 1;
-            const formatRequests = pdCellRanges.map(({ startRow, endRow }) => ({
-                repeatCell: {
-                    range: {
-                        sheetId,
-                        startRowIndex: startRow - 1,
-                        endRowIndex: endRow - 1,
-                        startColumnIndex: colIdx,
-                        endColumnIndex: colIdx + 1,
-                    },
-                    cell: {
-                        userEnteredFormat: {
-                            numberFormat: { type: "NUMBER", pattern: '"+"0;-0;0' },
-                        },
-                    },
-                    fields: "userEnteredFormat.numberFormat",
-                },
-            }));
+        if (sheetId != null) {
+            const letterToIdx = (letters) =>
+                letters.split("").reduce((acc, c) => acc * 26 + (c.charCodeAt(0) - 64), 0) - 1;
+            const pdIdx     = letterToIdx(pdCol);
+            const rankIdx   = letterToIdx(rankCol);
+            const seedIdx   = letterToIdx(seedCol);
 
-            await sheets.spreadsheets.batchUpdate({
-                spreadsheetId,
-                requestBody: { requests: formatRequests },
-            });
+            const requests = [];
+
+            // PD column: "+" prefix for positives
+            for (const { startRow, endRow } of pdCellRanges) {
+                requests.push({
+                    repeatCell: {
+                        range: {
+                            sheetId,
+                            startRowIndex: startRow - 1,
+                            endRowIndex: endRow - 1,
+                            startColumnIndex: pdIdx,
+                            endColumnIndex: pdIdx + 1,
+                        },
+                        cell: {
+                            userEnteredFormat: {
+                                numberFormat: { type: "NUMBER", pattern: '"+"0;-0;0' },
+                            },
+                        },
+                        fields: "userEnteredFormat.numberFormat",
+                    },
+                });
+            }
+
+            // Top 2 rows of each group's standings: pink text color across Z:AG.
+            // Uses only textFormat.foregroundColor so any existing background,
+            // borders, alignment, etc. on those cells stays intact.
+            // #df63fa = rgb(223, 99, 250)
+            const pink = { red: 223 / 255, green: 99 / 255, blue: 250 / 255 };
+            for (const { startRow, endRow } of highlightRanges) {
+                requests.push({
+                    repeatCell: {
+                        range: {
+                            sheetId,
+                            startRowIndex: startRow - 1,
+                            endRowIndex: endRow - 1,
+                            startColumnIndex: rankIdx,
+                            endColumnIndex: seedIdx + 1,
+                        },
+                        cell: {
+                            userEnteredFormat: {
+                                textFormat: { foregroundColor: pink },
+                            },
+                        },
+                        fields: "userEnteredFormat.textFormat.foregroundColor",
+                    },
+                });
+            }
+
+            if (requests.length > 0) {
+                await sheets.spreadsheets.batchUpdate({
+                    spreadsheetId,
+                    requestBody: { requests },
+                });
+            }
         }
     } catch (err) {
-        console.warn(`⚠️ Fórmulas escritas, mas não consegui aplicar o formato "+" em PD: ${err.message ?? err}`);
+        console.warn(`⚠️ Fórmulas escritas, mas não consegui aplicar formatação: ${err.message ?? err}`);
     }
 
     return { groups: groups.length, updatesWritten: updates.length };
