@@ -2,8 +2,10 @@ import dotenv from "dotenv";
 import { Client, IntentsBitField, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } from "discord.js";
 import utils from "./utils.js";
 import { trackMatch } from "./osuTracker.js";
+import { setupStandingsFormulas, updateLobbyDateTime, updateLobbyReferee, syncGroupStandings, updateLobbySeriesScore } from "./googleSheets.js";
 
 dotenv.config();
+const REFEREE_ROLE_ID = "1157479282700992552";
 
 const client = new Client({
     intents: [
@@ -24,10 +26,14 @@ client.on("interactionCreate", async (interaction) => {
     if (interaction.isChatInputCommand()) {
         if (interaction.commandName === "reschedule") {
             const author = interaction.member;
-            const opponent = interaction.options.getUser("capitão-do-time-adversário"); 
-            const date = interaction.options.getString("data");
-            const time = interaction.options.getString("horário");
-            const id = interaction.options.getInteger("id");
+            const opponent = interaction.options.getUser("player-do-time-adversário"); 
+            const date = interaction.options.getString("nova-data");
+            const time = interaction.options.getString("novo-horário");
+            const lobby = interaction.options.getString("lobby")?.trim().toUpperCase();
+            if (!lobby) {
+                await interaction.reply({ content: "Lobby inválida.", ephemeral: true });
+                return;
+            }
             const datetime = `${date} ${time}`;
 
             // --- VALIDAÇÕES (Mantemos reply ephemeral aqui pois é rápido) ---
@@ -47,19 +53,19 @@ client.on("interactionCreate", async (interaction) => {
             try {
                 const rescheduleEmbed = new EmbedBuilder()
                     .setColor(0xFFA07A)
-                    .setTitle(`📅 Match ID: ${id} - Reschedule`) 
+                    .setTitle(`📅 Lobby ${lobby} - Reschedule`) 
                     .setDescription(`O capitão ${author} pediu um reschedule na partida contra o time de ${opponent}.`)
                     .setThumbnail(author.user.displayAvatarURL())
                     .addFields(
                         { name: 'Capitão Solicitante', value: `${author}`, inline: true },
                         { name: 'Capitão Adversário', value: `${opponent}`, inline: true },
-                        { name: '\u200B', value: '\u200B', inline: true },
+                        { name: 'Lobby', value: `**${lobby}**`, inline: true },
                         { name: 'Nova Data', value: `**${date}**`, inline: true },
                         { name: 'Novo Horário', value: `**${time}**`, inline: true },
                         { name: 'Data e Horário (Completo)', value: `${datetime}`, inline: true }
                     )
                     .setTimestamp()
-                    .setFooter({ text: `ID:${id} | Aprovação necessária de ${opponent.tag}` });
+                    .setFooter({ text: `Lobby:${lobby} | Aprovação necessária de ${opponent.tag}` });
 
                 const acceptButton = new ButtonBuilder()
                     .setCustomId('reschedule_accept')
@@ -92,19 +98,30 @@ client.on("interactionCreate", async (interaction) => {
         }   
 
         if (interaction.commandName === "track") {
+            const hasRefereeRole = interaction.member?.roles?.cache?.has(REFEREE_ROLE_ID);
+            if (!hasRefereeRole) {
+                await interaction.reply({
+                    content: "🚫 Apenas usuários com o cargo de referee podem usar este comando.",
+                    ephemeral: true,
+                });
+                return;
+            }
+
             const matchId = interaction.options.getInteger("id");
             const bestOf = interaction.options.getInteger("best_of") || 13; 
+            const lobby = interaction.options.getString("lobby")?.trim().toUpperCase() || null;
             
             // 1. Avisa o Discord que vamos processar (Isso gera o "Pensando...")
             await interaction.deferReply({ ephemeral: true });
     
             try {
                 // Tenta rodar a função. Se der erro AQUI DENTRO, ele pula pro 'catch'
-                const success = await trackMatch(matchId, interaction.channel, bestOf);
+                const success = await trackMatch(matchId, interaction.channel, bestOf, lobby);
     
                 if (success) {
                     const pointsToWin = Math.ceil(bestOf / 2);
-                    await interaction.editReply(`✅ Monitorando MP **${matchId}** (Melhor de ${bestOf} - Ganha com ${pointsToWin}).`);
+                    const lobbyText = lobby ? ` | Lobby: **${lobby}**` : "";
+                    await interaction.editReply(`✅ Monitorando MP **${matchId}** (Melhor de ${bestOf} - Ganha com ${pointsToWin})${lobbyText}.`);
                 } else {
                     // Se o trackMatch retornar false (ex: sala não existe ou já está monitorando)
                     await interaction.editReply(`❌ Não consegui entrar na sala **${matchId}**. Verifique se ela existe, se a senha do IRC está certa ou se eu já estou nela.`);
@@ -118,6 +135,157 @@ client.on("interactionCreate", async (interaction) => {
                 await interaction.editReply({ 
                     content: `☠️ **Ocorreu um erro interno ao tentar rastrear a partida.**\nVerifique o terminal para mais detalhes.` 
                 });
+            }
+        }
+
+        if (interaction.commandName === "ref") {
+            const lobby = interaction.options.getString("lobby")?.trim().toUpperCase();
+            const username = interaction.options.getString("username")?.trim();
+            const hasRefereeRole = interaction.member?.roles?.cache?.has(REFEREE_ROLE_ID);
+
+            if (!hasRefereeRole) {
+                await interaction.reply({
+                    content: "🚫 Apenas usuários com o cargo de referee podem usar este comando.",
+                    ephemeral: true,
+                });
+                return;
+            }
+
+            if (!lobby) {
+                await interaction.reply({ content: "Lobby inválida.", ephemeral: true });
+                return;
+            }
+            if (!username) {
+                await interaction.reply({ content: "Username inválido.", ephemeral: true });
+                return;
+            }
+
+            await interaction.deferReply({ ephemeral: true });
+
+            try {
+                await updateLobbyReferee(lobby, username);
+                await interaction.editReply(`✅ Referee da lobby **${lobby}** atualizado para **${username}**.`);
+            } catch (error) {
+                console.error("Erro ao atualizar referee no Google Sheets:", error);
+                await interaction.editReply("❌ Não consegui atualizar a coluna Referee na planilha.");
+            }
+        }
+
+        if (interaction.commandName === "unref") {
+            const lobby = interaction.options.getString("lobby")?.trim().toUpperCase();
+            const hasRefereeRole = interaction.member?.roles?.cache?.has(REFEREE_ROLE_ID);
+
+            if (!hasRefereeRole) {
+                await interaction.reply({
+                    content: "🚫 Apenas usuários com o cargo de referee podem usar este comando.",
+                    ephemeral: true,
+                });
+                return;
+            }
+
+            if (!lobby) {
+                await interaction.reply({ content: "Lobby inválida.", ephemeral: true });
+                return;
+            }
+
+            await interaction.deferReply({ ephemeral: true });
+
+            try {
+                await updateLobbyReferee(lobby, "");
+                await interaction.editReply(`✅ Referee da lobby **${lobby}** removido.`);
+            } catch (error) {
+                console.error("Erro ao remover referee no Google Sheets:", error);
+                await interaction.editReply("❌ Não consegui remover o referee na planilha.");
+            }
+        }
+
+        if (interaction.commandName === "standings") {
+            const lobbyInput = interaction.options.getString("lobby")?.trim().toUpperCase();
+            const hasRefereeRole = interaction.member?.roles?.cache?.has(REFEREE_ROLE_ID);
+
+            if (!hasRefereeRole) {
+                await interaction.reply({
+                    content: "🚫 Apenas usuários com o cargo de referee podem usar este comando.",
+                    ephemeral: true,
+                });
+                return;
+            }
+
+            if (!lobbyInput) {
+                await interaction.reply({ content: "Lobby inválida.", ephemeral: true });
+                return;
+            }
+
+            const groupCode = lobbyInput.charAt(0);
+            await interaction.deferReply({ ephemeral: true });
+
+            try {
+                const result = await syncGroupStandings(groupCode);
+                await interaction.editReply(`✅ Standings do grupo **${result.group}** atualizadas (${result.updatedRows} jogadores).`);
+            } catch (error) {
+                console.error("Erro ao recalcular standings:", error);
+                await interaction.editReply("❌ Não consegui recalcular as standings desse grupo.");
+            }
+        }
+
+        if (interaction.commandName === "score") {
+            const lobby = interaction.options.getString("lobby")?.trim().toUpperCase();
+            const team1 = interaction.options.getInteger("team1");
+            const team2 = interaction.options.getInteger("team2");
+            const hasRefereeRole = interaction.member?.roles?.cache?.has(REFEREE_ROLE_ID);
+
+            if (!hasRefereeRole) {
+                await interaction.reply({
+                    content: "🚫 Apenas usuários com o cargo de referee podem usar este comando.",
+                    ephemeral: true,
+                });
+                return;
+            }
+
+            if (!lobby || team1 == null || team2 == null) {
+                await interaction.reply({ content: "Parâmetros inválidos.", ephemeral: true });
+                return;
+            }
+
+            if (team1 < 0 || team2 < 0) {
+                await interaction.reply({ content: "Scores não podem ser negativos.", ephemeral: true });
+                return;
+            }
+
+            await interaction.deferReply({ ephemeral: true });
+
+            try {
+                await updateLobbySeriesScore(lobby, team1, team2);
+                await interaction.editReply(
+                    `✅ Score da lobby **${lobby}** atualizado para **${team1} x ${team2}** na planilha. As standings atualizam automaticamente pelas fórmulas da sheet.`
+                );
+            } catch (error) {
+                console.error("Erro ao atualizar score manual:", error);
+                await interaction.editReply("❌ Não consegui atualizar score na planilha.");
+            }
+        }
+
+        if (interaction.commandName === "setup-standings") {
+            const hasRefereeRole = interaction.member?.roles?.cache?.has(REFEREE_ROLE_ID);
+
+            if (!hasRefereeRole) {
+                await interaction.reply({
+                    content: "🚫 Apenas usuários com o cargo de referee podem usar este comando.",
+                    ephemeral: true,
+                });
+                return;
+            }
+
+            await interaction.deferReply({ ephemeral: true });
+
+            try {
+                const result = await setupStandingsFormulas();
+                await interaction.editReply(
+                    `✅ Fórmulas de standings configuradas em **${result.groups}** grupos (${result.updatesWritten} células). As standings agora atualizam automaticamente — o bot não precisa estar online.`
+                );
+            } catch (error) {
+                console.error("Erro ao configurar fórmulas de standings:", error);
+                await interaction.editReply(`❌ Não consegui configurar as fórmulas: ${error.message}`);
             }
         }
     }
@@ -134,10 +302,11 @@ client.on("interactionCreate", async (interaction) => {
 
         const fieldSolicitante = embed.fields.find(f => f.name === 'Capitão Solicitante');
         const fieldAdversario = embed.fields.find(f => f.name === 'Capitão Adversário');
+        const fieldLobby = embed.fields.find(f => f.name === 'Lobby');
+        const fieldDate = embed.fields.find(f => f.name === 'Nova Data');
+        const fieldTime = embed.fields.find(f => f.name === 'Novo Horário');
         const fieldDataHora = embed.fields.find(f => f.name.includes('Completo'));
-        
-        const footerText = embed.footer.text; 
-        const matchId = footerText.split('|')[0].replace('ID:', '').trim(); 
+        const lobbyCode = (fieldLobby?.value || "").replace(/\*/g, "").trim().toUpperCase();
 
         const opponentIdMatch = fieldAdversario.value.match(/<@!?(\d+)>/);
         const opponentId = opponentIdMatch ? opponentIdMatch[1] : null;
@@ -156,17 +325,34 @@ client.on("interactionCreate", async (interaction) => {
         const STAFF_CHANNEL_ID = "1330252766072799282"; 
         const STAFF_ROLE_ID = "1157479282700992552";
 
+        let sheetUpdateError = null;
+
         if (customId === 'reschedule_accept') {
             newEmbed.setDescription(`${embed.description}\n\n**✅ Aceito:** O capitão ${buttonUser} confirmou a nova data.`);
-            newEmbed.setColor(0x00FF00); // Verde Hex direto (ButtonStyle as vezes buga em cor de embed)
+            newEmbed.setColor(0x00FF00);
             statusLog = "✅ **[RESCHEDULE ACCEPTED]**";
+            const dateValue = (fieldDate?.value || "").replace(/\*/g, "").trim();
+            const timeValue = (fieldTime?.value || "").replace(/\*/g, "").trim();
+            if (lobbyCode && dateValue && timeValue) {
+                try {
+                    const formattedDateForSheet = utils.formatDateForSheet(dateValue);
+                    await updateLobbyDateTime(lobbyCode, formattedDateForSheet, timeValue);
+                } catch (error) {
+                    sheetUpdateError = error;
+                    console.error("Erro ao atualizar Google Sheets:", error.message ?? error);
+                    await interaction.followUp({
+                        content: `⚠️ Reschedule aceito, mas não consegui atualizar a planilha para a lobby **${lobbyCode}**. Staff foi notificado.`,
+                        ephemeral: true
+                    });
+                }
+            }
         } else {
             newEmbed.setDescription(`${embed.description}\n\n**❌ Recusado:** O capitão ${buttonUser} recusou a data.`);
-            newEmbed.setColor(0xFF0000); // Vermelho Hex
+            newEmbed.setColor(0xFF0000);
             statusLog = "❌ **[RESCHEDULE DECLINED]**";
         }
 
-        newEmbed.setFooter({ text: `Decisão tomada por ${buttonUser.tag} | Match ID: ${matchId}`, iconURL: buttonUser.displayAvatarURL() });
+        newEmbed.setFooter({ text: `Decisão tomada por ${buttonUser.tag} | Lobby: ${lobbyCode || "N/A"}`, iconURL: buttonUser.displayAvatarURL() });
 
         // Como usamos deferUpdate lá em cima, usamos editReply aqui para alterar a mensagem original
         await interaction.editReply({
@@ -177,20 +363,29 @@ client.on("interactionCreate", async (interaction) => {
         const staffChannel = await interaction.client.channels.fetch(STAFF_CHANNEL_ID).catch(() => null);
         
         if (staffChannel) {
+            const shouldPingStaff = customId !== 'reschedule_accept' || sheetUpdateError != null;
+            const staffEmbed = new EmbedBuilder()
+                .setTitle(statusLog)
+                .setColor(customId === 'reschedule_accept' ? (sheetUpdateError ? 0xFFA500 : 0x00FF00) : 0xFF0000)
+                .addFields(
+                    { name: 'Lobby', value: lobbyCode || 'N/A', inline: true },
+                    { name: 'Team Captain', value: fieldSolicitante.value, inline: true },
+                    { name: 'Opponent Captain', value: fieldAdversario.value, inline: true },
+                    { name: 'Date & Time', value: fieldDataHora ? fieldDataHora.value : 'N/A', inline: false }
+                )
+                .setTimestamp();
+
+            if (sheetUpdateError) {
+                staffEmbed.addFields({
+                    name: '⚠️ Falha na Planilha',
+                    value: `A planilha **não foi atualizada**.\nErro: \`${sheetUpdateError.message}\`\nAtualize manualmente a lobby **${lobbyCode}**.`,
+                    inline: false
+                });
+            }
+
             await staffChannel.send({
-                content: `<@&${STAFF_ROLE_ID}>`, 
-                embeds: [
-                    new EmbedBuilder()
-                        .setTitle(statusLog)
-                        .setColor(customId === 'reschedule_accept' ? 0x00FF00 : 0xFF0000)
-                        .addFields(
-                            { name: 'Match ID', value: matchId, inline: true },
-                            { name: 'Team Captain', value: fieldSolicitante.value, inline: true },
-                            { name: 'Opponent Captain', value: fieldAdversario.value, inline: true },
-                            { name: 'Date & Time', value: fieldDataHora ? fieldDataHora.value : 'N/A', inline: false }
-                        )
-                        .setTimestamp()
-                ]
+                content: shouldPingStaff ? `<@&${STAFF_ROLE_ID}>` : undefined,
+                embeds: [staffEmbed],
             });
         }
     }

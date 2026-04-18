@@ -8,6 +8,7 @@ const commands = [
     {
         name: 'track',
         description: 'Começa a monitorar uma partida de osu!',
+        default_member_permissions: "0",
         options: [
             {
                 name: 'id',
@@ -21,6 +22,12 @@ const commands = [
                 type: 4, 
                 required: true,
             },
+            {
+                name: "lobby",
+                description: "Código da lobby para sync na planilha (ex.: B1)",
+                type: ApplicationCommandOptionType.String,
+                required: false,
+            },
         ],
     },
    
@@ -29,30 +36,105 @@ const commands = [
         description: "Remarcar partida",
         options: [
             {
-                name: "capitão-do-time-adversário",
-                description: "Capitão do time adversário",
+                name: "player-do-time-adversário",
+                description: "Jogador do time adversário",
                 type: ApplicationCommandOptionType.User,
                 required: true,
             },
             {
-                name: "id",
-                description: "ID da sua match (exemplo: 14)",
-                type: ApplicationCommandOptionType.Integer,
+                name: "lobby",
+                description: "Código da lobby na planilha (ex.: B1)",
+                type: ApplicationCommandOptionType.String,
                 required: true,
-            },           
+            },
             {
-                name: "data",
+                name: "nova-data",
                 description: "dia da partida (use por exemplo, 03/04)",
                 type: ApplicationCommandOptionType.String,
                 required: true,
             }, 
             {
-                name: "horário",
+                name: "novo-horário",
                 description: "Horário(use por exemplo, 15:00)",
                 type: ApplicationCommandOptionType.String,
                 required: true,
             },
         ],
+    },
+    {
+        name: "ref",
+        description: "Define o árbitro da lobby na planilha",
+        default_member_permissions: "0",
+        options: [
+            {
+                name: "lobby",
+                description: "Código da lobby na planilha (ex.: B1)",
+                type: ApplicationCommandOptionType.String,
+                required: true,
+            },
+            {
+                name: "username",
+                description: "Nome do referee para salvar na coluna Referee",
+                type: ApplicationCommandOptionType.String,
+                required: true,
+            },
+        ],
+    },
+    {
+        name: "unref",
+        description: "Remove o árbitro de uma lobby na planilha",
+        default_member_permissions: "0",
+        options: [
+            {
+                name: "lobby",
+                description: "Código da lobby na planilha (ex.: B1)",
+                type: ApplicationCommandOptionType.String,
+                required: true,
+            },
+        ],
+    },
+    {
+        name: "standings",
+        description: "Recalcula standings de um grupo (W/L/PF/PA/PD)",
+        default_member_permissions: "0",
+        options: [
+            {
+                name: "lobby",
+                description: "Lobby ou grupo (ex.: B1 ou B)",
+                type: ApplicationCommandOptionType.String,
+                required: true,
+            },
+        ],
+    },
+    {
+        name: "score",
+        description: "Atualiza score de uma lobby e recalcula standings",
+        default_member_permissions: "0",
+        options: [
+            {
+                name: "lobby",
+                description: "Código da lobby (ex.: B1)",
+                type: ApplicationCommandOptionType.String,
+                required: true,
+            },
+            {
+                name: "team1",
+                description: "Pontos do Team 1 (backend sheet)",
+                type: ApplicationCommandOptionType.Integer,
+                required: true,
+            },
+            {
+                name: "team2",
+                description: "Pontos do Team 2 (backend sheet)",
+                type: ApplicationCommandOptionType.Integer,
+                required: true,
+            },
+        ],
+    },
+    {
+        name: "setup-standings",
+        description: "Escreve fórmulas de standings na sheet 2 (roda uma vez, funciona sem o bot online)",
+        default_member_permissions: "0",
     },
 ];
 
