@@ -2,7 +2,8 @@ import dotenv from "dotenv";
 import { Client, IntentsBitField, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } from "discord.js";
 import utils from "./utils.js";
 import { trackMatch } from "./osuTracker.js";
-import { setupStandingsFormulas, resortGroupsBySeed, updateLobbyDateTime, updateLobbyReferee, syncGroupStandings, updateLobbySeriesScore } from "./googleSheets.js";
+import { setupStandingsFormulas, resortGroupsBySeed, syncScheduleIds, updateLobbyDateTime, updateLobbyReferee, syncGroupStandings, updateLobbySeriesScore } from "./googleSheets.js";
+import { startRefereeReminders } from "./refScheduler.js";
 
 dotenv.config();
 const REFEREE_ROLE_ID = "1157479282700992552";
@@ -18,6 +19,8 @@ const client = new Client({
 
 client.on("ready", (c) => {
     console.log(`I am on!! 🦈🌸 Logged in as ${c.user.tag}`);
+    startRefereeReminders(c);
+    console.log(`⏰ Ref reminders iniciados (25 min antes de cada partida).`);
 });
 
 client.on("interactionCreate", async (interaction) => {
@@ -116,7 +119,7 @@ client.on("interactionCreate", async (interaction) => {
     
             try {
                 // Tenta rodar a função. Se der erro AQUI DENTRO, ele pula pro 'catch'
-                const success = await trackMatch(matchId, interaction.channel, bestOf, lobby);
+                const success = await trackMatch(matchId, interaction.channel, bestOf, lobby, interaction.user);
     
                 if (success) {
                     const pointsToWin = Math.ceil(bestOf / 2);
@@ -333,6 +336,40 @@ client.on("interactionCreate", async (interaction) => {
             } catch (error) {
                 console.error("Erro ao reordenar grupos:", error);
                 await interaction.editReply(`❌ Não consegui reordenar os grupos: ${error.message}`);
+            }
+        }
+
+        if (interaction.commandName === "sync-ids") {
+            const hasRefereeRole = interaction.member?.roles?.cache?.has(REFEREE_ROLE_ID);
+
+            if (!hasRefereeRole) {
+                await interaction.reply({
+                    content: "🚫 Apenas usuários com o cargo de referee podem usar este comando.",
+                    ephemeral: true,
+                });
+                return;
+            }
+
+            await interaction.deferReply({ ephemeral: true });
+
+            try {
+                const result = await syncScheduleIds();
+                const lines = [
+                    `✅ Coluna ID da Schedule atualizada.`,
+                    `• ${result.matched} linhas com ID atribuído`,
+                ];
+                if (result.cleared > 0) {
+                    lines.push(`• ${result.cleared} linha(s) tiveram ID limpo (não encontrado na sheet 2)`);
+                }
+                if (result.unmatched.length > 0) {
+                    const preview = result.unmatched.slice(0, 5).map((u) => `row ${u.row}: ${u.players}`).join("\n");
+                    const more = result.unmatched.length > 5 ? `\n… +${result.unmatched.length - 5} outras` : "";
+                    lines.push(`\n⚠️ ${result.unmatched.length} linha(s) sem correspondência na sheet 2:\n${preview}${more}`);
+                }
+                await interaction.editReply(lines.join("\n"));
+            } catch (error) {
+                console.error("Erro ao sincronizar IDs:", error);
+                await interaction.editReply(`❌ Não consegui sincronizar IDs: ${error.message}`);
             }
         }
     }

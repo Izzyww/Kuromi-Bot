@@ -8,7 +8,6 @@ const commands = [
     {
         name: 'track',
         description: 'Começa a monitorar uma partida de osu!',
-        default_member_permissions: "0",
         options: [
             {
                 name: 'id',
@@ -64,7 +63,6 @@ const commands = [
     {
         name: "ref",
         description: "Define o árbitro da lobby na planilha",
-        default_member_permissions: "0",
         options: [
             {
                 name: "lobby",
@@ -83,7 +81,6 @@ const commands = [
     {
         name: "unref",
         description: "Remove o árbitro de uma lobby na planilha",
-        default_member_permissions: "0",
         options: [
             {
                 name: "lobby",
@@ -139,6 +136,11 @@ const commands = [
     {
         name: "resort-groups",
         description: "Reordena grupos (A-D Dreamers, E-H Mischiefs) por avg seed — menor seed = grupo A/E",
+        default_member_permissions: "0",
+    },
+    {
+        name: "sync-ids",
+        description: "Atualiza a coluna ID da ref sheet (col I) com os códigos atuais (A1, D3...) da sheet 2",
         default_member_permissions: "0",
     },
 ];

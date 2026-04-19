@@ -7,7 +7,7 @@ let sheetsClient = null;
 const DEFAULT_GROUPS_SPREADSHEET_ID = "18kTX8-XpCy0D37ez7tV-yg_UBTdJLkxvwXiDIHWeLBU";
 const DEFAULT_GROUPS_TAB_NAME = "groups schedule";
 
-function getSheetsClient() {
+export function getSheetsClient() {
     if (sheetsClient) {
         return sheetsClient;
     }
@@ -54,13 +54,31 @@ async function findLobbyRow(sheets, spreadsheetId, sheetName, lobbyColumn, lobby
 }
 
 /**
+ * Sheet 1 (Schedule) column layout — the "ID" column at I was labeled in an
+ * existing empty column, NOT inserted, so no other columns shifted:
+ *   D = lobby number (1, 2, 3...)    — sequential, not a cross-reference key
+ *   E = date
+ *   F = time
+ *   G = player 1
+ *   H = player 2
+ *   I = ID label (display only, synced from Sheet 2 via syncScheduleIds)
+ *   J = referee
+ *   M = team 1 score
+ *   N = team 2 score
+ *   P = match tab name
+ *
+ * Sheet 2 (groups schedule):
+ *   G = lobby code ("A1" etc.), H = date, I = time, M = player 1, P = player 2,
+ *   N = team 1 score, O = team 2 score, Q = referee, Z:AG = standings block.
+ */
+
+/**
  * Resolves a lobby code (e.g. "A1") to its row in Sheet 1's Schedule tab.
  *
- * Schedule's lobby column holds sequential numbers (1, 2, 3...) — not lobby
- * codes — so we can't search it directly. We cross-reference via players:
- *   1. Find the lobby code in Sheet 2 (groups schedule) col G → read players
- *      from cols M and P of that row.
- *   2. Find the row in Sheet 1's Schedule where cols G and H contain those
+ * Schedule's lobby column (D) holds sequential numbers, not lobby codes, so we
+ * can't search it directly. Cross-reference via players (see layout comment):
+ *   1. Find the lobby code in Sheet 2 col G → read players from M and P.
+ *   2. Find the row in Sheet 1 Schedule where cols G and H contain those
  *      two players (in either order).
  *
  * @returns {Promise<{ scheduleRow: number, player1: string, player2: string, tabName: string|null }>}
@@ -77,8 +95,7 @@ async function findScheduleRowByLobbyCode(sheets, lobbyCode) {
         throw new Error("GOOGLE_SHEETS_ID is not configured.");
     }
 
-    // Sheet 2: lobby code → players (G=lobby, M=player1, P=player2).
-    // Reading G:P puts G at index 0, M at 6, P at 9.
+    // Sheet 2 G:P → G=0, M=6, P=9.
     const groupsResp = await sheets.spreadsheets.values.get({
         spreadsheetId: groupsSpreadsheetId,
         range: `${groupsTabName}!G:P`,
@@ -102,8 +119,7 @@ async function findScheduleRowByLobbyCode(sheets, lobbyCode) {
         );
     }
 
-    // Sheet 1: players → Schedule row (G=player1, H=player2, P=tab name).
-    // Reading G:P: G=0, H=1, P=9.
+    // Sheet 1 G:P → G=0, H=1, P=9 (tab name).
     const scheduleResp = await sheets.spreadsheets.values.get({
         spreadsheetId: scheduleSpreadsheetId,
         range: `${scheduleTabName}!G:P`,
@@ -126,6 +142,107 @@ async function findScheduleRowByLobbyCode(sheets, lobbyCode) {
         `Lobby "${lobbyCode}" (${player1} vs ${player2}) not found in "${scheduleTabName}" — ` +
         `check that both players are in cols G/H of the Schedule.`
     );
+}
+
+/**
+ * Syncs Sheet 1's "ID" column (col I) so each Schedule row shows the lobby
+ * code ("A1", "D3", etc.) its matchup corresponds to on Sheet 2.
+ *
+ * Purely cosmetic: Sheet 1's ID column is for human reference. Everywhere else
+ * in the bot we still cross-reference by player names (col G/H of Schedule)
+ * so reschedule / ref / score / standings keep working even if IDs drift.
+ *
+ * Lookup is done by matching the pair of players on each Schedule row to a
+ * match row on Sheet 2 (M/P, either ordering). Rows whose players don't
+ * appear on Sheet 2 are skipped and reported as "unmatched".
+ *
+ * @returns {Promise<{ matched: number, cleared: number, unmatched: Array<{row: number, players: string}> }>}
+ */
+export async function syncScheduleIds() {
+    const sheets = getSheetsClient();
+
+    const groupsSpreadsheetId = process.env.GOOGLE_GROUPS_SHEETS_ID || DEFAULT_GROUPS_SPREADSHEET_ID;
+    const groupsTabName = process.env.GOOGLE_GROUPS_TAB_NAME || DEFAULT_GROUPS_TAB_NAME;
+    const scheduleSpreadsheetId = process.env.GOOGLE_SHEETS_ID;
+    const scheduleTabName = process.env.GOOGLE_SHEETS_TAB_NAME || "Schedule";
+    const idCol = "I";
+
+    if (!scheduleSpreadsheetId) {
+        throw new Error("GOOGLE_SHEETS_ID is not configured.");
+    }
+
+    // Sheet 2: build (sorted-player-pair → lobby code) map.
+    const groupsResp = await sheets.spreadsheets.values.get({
+        spreadsheetId: groupsSpreadsheetId,
+        range: `${groupsTabName}!G:P`,
+    });
+    const groupsRows = groupsResp.data.values || [];
+
+    const pairKey = (a, b) => [a.trim(), b.trim()].sort().join("|");
+    const lobbyByPair = new Map();
+    for (const row of groupsRows) {
+        const code = String(row?.[0] || "").trim().toUpperCase();
+        if (!/^[A-Z]\d+$/.test(code)) continue;
+        const p1 = String(row?.[6] || "").trim();
+        const p2 = String(row?.[9] || "").trim();
+        if (!p1 || !p2) continue;
+        lobbyByPair.set(pairKey(p1, p2), code);
+    }
+
+    // Sheet 1: walk G/H, set col I to matching lobby code (or clear if not found).
+    const scheduleResp = await sheets.spreadsheets.values.get({
+        spreadsheetId: scheduleSpreadsheetId,
+        range: `${scheduleTabName}!G:I`,
+    });
+    const scheduleRows = scheduleResp.data.values || [];
+
+    const updates = [];
+    const unmatched = [];
+    let matched = 0;
+    let cleared = 0;
+
+    for (let i = 0; i < scheduleRows.length; i++) {
+        const row = scheduleRows[i] || [];
+        const g = String(row[0] || "").trim();
+        const h = String(row[1] || "").trim();
+        const existingId = String(row[2] || "").trim();
+        const rowNumber = i + 1;
+
+        if (!g || !h) continue; // empty schedule row — skip
+
+        const code = lobbyByPair.get(pairKey(g, h));
+        if (code) {
+            if (existingId !== code) {
+                updates.push({
+                    range: `${scheduleTabName}!${idCol}${rowNumber}`,
+                    values: [[code]],
+                });
+            }
+            matched += 1;
+        } else {
+            // Pair not on Sheet 2 — clear any stale ID so it doesn't mislead.
+            if (existingId) {
+                updates.push({
+                    range: `${scheduleTabName}!${idCol}${rowNumber}`,
+                    values: [[""]],
+                });
+                cleared += 1;
+            }
+            unmatched.push({ row: rowNumber, players: `${g} vs ${h}` });
+        }
+    }
+
+    if (updates.length > 0) {
+        await sheets.spreadsheets.values.batchUpdate({
+            spreadsheetId: scheduleSpreadsheetId,
+            requestBody: {
+                valueInputOption: "RAW",
+                data: updates,
+            },
+        });
+    }
+
+    return { matched, cleared, unmatched };
 }
 
 /**
