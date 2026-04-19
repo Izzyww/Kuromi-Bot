@@ -54,15 +54,92 @@ async function findLobbyRow(sheets, spreadsheetId, sheetName, lobbyColumn, lobby
 }
 
 /**
+ * Resolves a lobby code (e.g. "A1") to its row in Sheet 1's Schedule tab.
+ *
+ * Schedule's lobby column holds sequential numbers (1, 2, 3...) — not lobby
+ * codes — so we can't search it directly. We cross-reference via players:
+ *   1. Find the lobby code in Sheet 2 (groups schedule) col G → read players
+ *      from cols M and P of that row.
+ *   2. Find the row in Sheet 1's Schedule where cols G and H contain those
+ *      two players (in either order).
+ *
+ * @returns {Promise<{ scheduleRow: number, player1: string, player2: string, tabName: string|null }>}
+ */
+async function findScheduleRowByLobbyCode(sheets, lobbyCode) {
+    const normalizedLobby = String(lobbyCode).trim().toUpperCase();
+
+    const groupsSpreadsheetId = process.env.GOOGLE_GROUPS_SHEETS_ID || DEFAULT_GROUPS_SPREADSHEET_ID;
+    const groupsTabName = process.env.GOOGLE_GROUPS_TAB_NAME || DEFAULT_GROUPS_TAB_NAME;
+    const scheduleSpreadsheetId = process.env.GOOGLE_SHEETS_ID;
+    const scheduleTabName = process.env.GOOGLE_SHEETS_TAB_NAME || "Schedule";
+
+    if (!scheduleSpreadsheetId) {
+        throw new Error("GOOGLE_SHEETS_ID is not configured.");
+    }
+
+    // Sheet 2: lobby code → players (G=lobby, M=player1, P=player2).
+    // Reading G:P puts G at index 0, M at 6, P at 9.
+    const groupsResp = await sheets.spreadsheets.values.get({
+        spreadsheetId: groupsSpreadsheetId,
+        range: `${groupsTabName}!G:P`,
+    });
+    const groupsRows = groupsResp.data.values || [];
+
+    let player1 = null;
+    let player2 = null;
+    for (const row of groupsRows) {
+        const code = String(row?.[0] || "").trim().toUpperCase();
+        if (code === normalizedLobby) {
+            player1 = String(row?.[6] || "").trim();
+            player2 = String(row?.[9] || "").trim();
+            break;
+        }
+    }
+
+    if (!player1 || !player2) {
+        throw new Error(
+            `Lobby "${lobbyCode}" not found in "${groupsTabName}" (or players missing in cols M/P).`
+        );
+    }
+
+    // Sheet 1: players → Schedule row (G=player1, H=player2, P=tab name).
+    // Reading G:P: G=0, H=1, P=9.
+    const scheduleResp = await sheets.spreadsheets.values.get({
+        spreadsheetId: scheduleSpreadsheetId,
+        range: `${scheduleTabName}!G:P`,
+    });
+    const scheduleRows = scheduleResp.data.values || [];
+
+    for (let i = 0; i < scheduleRows.length; i++) {
+        const row = scheduleRows[i];
+        const g = String(row?.[0] || "").trim();
+        const h = String(row?.[1] || "").trim();
+        const matches =
+            (g === player1 && h === player2) || (g === player2 && h === player1);
+        if (matches) {
+            const tabName = String(row?.[9] || "").trim();
+            return { scheduleRow: i + 1, player1, player2, tabName: tabName || null };
+        }
+    }
+
+    throw new Error(
+        `Lobby "${lobbyCode}" (${player1} vs ${player2}) not found in "${scheduleTabName}" — ` +
+        `check that both players are in cols G/H of the Schedule.`
+    );
+}
+
+/**
+ * Updates the date/time for a lobby's match on Sheet 1's Schedule. Looks up
+ * the Schedule row by cross-referencing player names (see findScheduleRowByLobbyCode).
+ *
  * @param {string} lobbyCode
  * @param {string} dateValue
  * @param {string} timeValue
- * @returns {Promise<{ rowNumber: number, lobbyColumnLetter: string }>}
+ * @returns {Promise<{ rowNumber: number, player1: string, player2: string }>}
  */
 export async function updateLobbyDateTime(lobbyCode, dateValue, timeValue) {
     const spreadsheetId = process.env.GOOGLE_SHEETS_ID;
-    const sheetName = process.env.GOOGLE_SHEETS_TAB_NAME || "Sheet1";
-    const lobbyColumn = process.env.GOOGLE_SHEETS_LOBBY_COLUMN || "A";
+    const sheetName = process.env.GOOGLE_SHEETS_TAB_NAME || "Schedule";
     const dateColumn = process.env.GOOGLE_SHEETS_DATE_COLUMN;
     const timeColumn = process.env.GOOGLE_SHEETS_TIME_COLUMN;
     const datetimeColumn = process.env.GOOGLE_SHEETS_DATETIME_COLUMN;
@@ -78,11 +155,7 @@ export async function updateLobbyDateTime(lobbyCode, dateValue, timeValue) {
     }
 
     const sheets = getSheetsClient();
-    const rowNumber = await findLobbyRow(sheets, spreadsheetId, sheetName, lobbyColumn, lobbyCode);
-
-    if (rowNumber === -1) {
-        throw new Error(`Lobby "${lobbyCode}" was not found in the sheet.`);
-    }
+    const { scheduleRow, player1, player2 } = await findScheduleRowByLobbyCode(sheets, lobbyCode);
 
     if (dateColumn && timeColumn) {
         await sheets.spreadsheets.values.batchUpdate({
@@ -91,11 +164,11 @@ export async function updateLobbyDateTime(lobbyCode, dateValue, timeValue) {
                 valueInputOption: "USER_ENTERED",
                 data: [
                     {
-                        range: `${sheetName}!${dateColumn}${rowNumber}`,
+                        range: `${sheetName}!${dateColumn}${scheduleRow}`,
                         values: [[dateValue]],
                     },
                     {
-                        range: `${sheetName}!${timeColumn}${rowNumber}`,
+                        range: `${sheetName}!${timeColumn}${scheduleRow}`,
                         values: [[timeValue]],
                     },
                 ],
@@ -103,33 +176,29 @@ export async function updateLobbyDateTime(lobbyCode, dateValue, timeValue) {
         });
     } else {
         const datetime = `${dateValue} ${timeValue}`.trim();
-        const updateRange = `${sheetName}!${datetimeColumn}${rowNumber}`;
-
         await sheets.spreadsheets.values.update({
             spreadsheetId,
-            range: updateRange,
+            range: `${sheetName}!${datetimeColumn}${scheduleRow}`,
             valueInputOption: "USER_ENTERED",
-            requestBody: {
-                values: [[datetime]],
-            },
+            requestBody: { values: [[datetime]] },
         });
     }
 
-    return {
-        rowNumber,
-        lobbyColumnLetter: lobbyColumn,
-    };
+    return { rowNumber: scheduleRow, player1, player2 };
 }
 
 /**
+ * Sets (or clears) the referee for a lobby's match on Sheet 1's Schedule.
+ * Cross-references lobby code → players → schedule row via
+ * findScheduleRowByLobbyCode.
+ *
  * @param {string} lobbyCode
  * @param {string} refereeValue
- * @returns {Promise<{ rowNumber: number, refereeColumnLetter: string }>}
+ * @returns {Promise<{ rowNumber: number, refereeColumnLetter: string, player1: string, player2: string }>}
  */
 export async function updateLobbyReferee(lobbyCode, refereeValue) {
     const spreadsheetId = process.env.GOOGLE_SHEETS_ID;
-    const sheetName = process.env.GOOGLE_SHEETS_TAB_NAME || "Sheet1";
-    const lobbyColumn = process.env.GOOGLE_SHEETS_LOBBY_COLUMN || "A";
+    const sheetName = process.env.GOOGLE_SHEETS_TAB_NAME || "Schedule";
     const refereeColumn = process.env.GOOGLE_SHEETS_REFEREE_COLUMN || "J";
 
     if (!spreadsheetId) {
@@ -137,24 +206,20 @@ export async function updateLobbyReferee(lobbyCode, refereeValue) {
     }
 
     const sheets = getSheetsClient();
-    const rowNumber = await findLobbyRow(sheets, spreadsheetId, sheetName, lobbyColumn, lobbyCode);
-
-    if (rowNumber === -1) {
-        throw new Error(`Lobby "${lobbyCode}" was not found in the sheet.`);
-    }
+    const { scheduleRow, player1, player2 } = await findScheduleRowByLobbyCode(sheets, lobbyCode);
 
     await sheets.spreadsheets.values.update({
         spreadsheetId,
-        range: `${sheetName}!${refereeColumn}${rowNumber}`,
+        range: `${sheetName}!${refereeColumn}${scheduleRow}`,
         valueInputOption: "USER_ENTERED",
-        requestBody: {
-            values: [[refereeValue]],
-        },
+        requestBody: { values: [[refereeValue]] },
     });
 
     return {
-        rowNumber,
+        rowNumber: scheduleRow,
         refereeColumnLetter: refereeColumn,
+        player1,
+        player2,
     };
 }
 
@@ -198,22 +263,16 @@ async function readAllScheduleScores(sheets, spreadsheetId, sheetName, lobbyColu
  */
 export async function updateLobbySeriesScore(lobbyCode, redScore, blueScore) {
     const spreadsheetId = process.env.GOOGLE_SHEETS_ID;
-    const sheetName = process.env.GOOGLE_SHEETS_TAB_NAME || "Schedule";
-    const lobbyColumn = process.env.GOOGLE_SHEETS_LOBBY_COLUMN || "D";
 
     if (!spreadsheetId) {
         throw new Error("GOOGLE_SHEETS_ID is not configured.");
     }
 
     const sheets = getSheetsClient();
-    const scoreMap = await readAllScheduleScores(sheets, spreadsheetId, sheetName, lobbyColumn);
-    const entry = scoreMap.get(lobbyCode.trim().toUpperCase());
+    const { tabName } = await findScheduleRowByLobbyCode(sheets, lobbyCode);
 
-    if (!entry) {
-        throw new Error(`Lobby "${lobbyCode}" was not found in the sheet.`);
-    }
-    if (!entry.tabName) {
-        throw new Error(`Lobby "${lobbyCode}" has no match tab assigned (column P is empty).`);
+    if (!tabName) {
+        throw new Error(`Lobby "${lobbyCode}" has no match tab assigned (column P is empty on Schedule).`);
     }
 
     await sheets.spreadsheets.values.batchUpdate({
@@ -221,13 +280,13 @@ export async function updateLobbySeriesScore(lobbyCode, redScore, blueScore) {
         requestBody: {
             valueInputOption: "USER_ENTERED",
             data: [
-                { range: `${entry.tabName}!C3`, values: [[String(redScore)]] },
-                { range: `${entry.tabName}!E3`, values: [[String(blueScore)]] },
+                { range: `${tabName}!C3`, values: [[String(redScore)]] },
+                { range: `${tabName}!E3`, values: [[String(blueScore)]] },
             ],
         },
     });
 
-    return { tabName: entry.tabName, team1Score: redScore, team2Score: blueScore };
+    return { tabName, team1Score: redScore, team2Score: blueScore };
 }
 
 // Stores the last known scores so the poller can detect changes.
@@ -684,12 +743,97 @@ export async function syncGroupStandings(groupCode) {
  *  Sheets may show #REF! until you click into an N/O cell and approve
  *  access. This is a one-time popup per sheet pair.
  */
-export async function setupStandingsFormulas() {
+// Column layout constants for Sheet 2 (groups schedule).
+const GROUPS_SHEET_COLS = {
+    lobbyCol: "G",
+    dateCol: "H",
+    timeCol: "I",
+    player1Col: "M",
+    player2Col: "P",
+    score1Col: "N",
+    score2Col: "O",
+    refCol: "Q",
+    rankCol: "Z",
+    playerCol: "AA",
+    winsCol: "AB",
+    lossesCol: "AC",
+    pfCol: "AD",
+    paCol: "AE",
+    pdCol: "AF",
+    seedCol: "AG",
+};
+
+/**
+ * Reads Sheet 2's groups schedule and returns a self-describing list of
+ * groupDetails per detected group. Every field the writer needs is captured
+ * here so downstream writes don't need to re-read the sheet.
+ *
+ * @returns {Promise<Array<{
+ *   letter: string, startIndex: number, startRow: number,
+ *   lobbyCodes: string[],      // 6 entries, one per match row
+ *   matchRows: Array<{m: string, p: string}>, // 6 entries
+ *   players: string[],         // 4 entries from AA of standings rows
+ *   seeds: number[],           // 4 entries from AG; missing seeds become 99
+ * }>>}
+ */
+async function readGroupDetails() {
+    const spreadsheetId = process.env.GOOGLE_GROUPS_SHEETS_ID || DEFAULT_GROUPS_SPREADSHEET_ID;
+    const sheetName = process.env.GOOGLE_GROUPS_TAB_NAME || DEFAULT_GROUPS_TAB_NAME;
+    const sheets = getSheetsClient();
+
+    const response = await sheets.spreadsheets.values.get({
+        spreadsheetId,
+        range: `${sheetName}!D1:AG`,
+    });
+    const rows = response.data.values || [];
+
+    const result = [];
+    for (let i = 0; i < rows.length; i++) {
+        const cell = String(rows[i]?.[3] || "").trim().toUpperCase();
+        if (!/^[A-Z]1$/.test(cell)) continue;
+
+        const letter = cell[0];
+        const startIndex = i;
+        const startRow = startIndex + 1;
+        const lobbyCodes = [];
+        const matchRows = [];
+        const players = [];
+        const seeds = [];
+
+        for (let k = 0; k < 6; k++) {
+            const row = rows[startIndex + k] || [];
+            lobbyCodes.push(String(row[3] || "").trim());
+            matchRows.push({
+                m: String(row[9] || "").trim(),  // col M (idx 9 inside D:AG)
+                p: String(row[12] || "").trim(), // col P (idx 12 inside D:AG)
+            });
+            if (k < 4) {
+                const name = String(row[23] || "").trim();     // col AA
+                const seedRaw = String(row[29] || "").trim();  // col AG
+                const seedNum = parseInt(seedRaw.replace(/^#/, ""), 10);
+                players.push(name);
+                seeds.push(Number.isFinite(seedNum) ? seedNum : 99);
+            }
+        }
+
+        result.push({ letter, startIndex, startRow, lobbyCodes, matchRows, players, seeds });
+    }
+
+    return result;
+}
+
+/**
+ * Writes score (N/O) and standings (Z:AG spill) formulas using pre-built
+ * groupDetails. Does NOT read the sheet itself — player/seed constants are
+ * taken from the input, so the caller controls exactly what gets baked into
+ * each group's spill formula. Also applies PD "+" number format and the
+ * top-2 pink text highlight.
+ */
+async function writeGroupStandingsFormulas(groupDetails) {
     const spreadsheetId = process.env.GOOGLE_GROUPS_SHEETS_ID || DEFAULT_GROUPS_SPREADSHEET_ID;
     const sheetName = process.env.GOOGLE_GROUPS_TAB_NAME || DEFAULT_GROUPS_TAB_NAME;
     const sourceSpreadsheetId = process.env.GOOGLE_SHEETS_ID;
     const sourceTabName = process.env.GOOGLE_SHEETS_TAB_NAME || "Schedule";
-    // On Sheet 1 (Schedule), players are in G/H and scores in M/N.
     const sourceP1Col = "G";
     const sourceP2Col = "H";
     const sourceS1Col = process.env.GOOGLE_SHEETS_RESULT_TEAM1_COLUMN || "M";
@@ -699,83 +843,40 @@ export async function setupStandingsFormulas() {
         throw new Error("GOOGLE_SHEETS_ID is not configured.");
     }
 
-    const lobbyCol   = process.env.GOOGLE_GROUPS_LOBBY_COLUMN || "G";
-    const player1Col = "M";
-    const player2Col = "P";
-    const score1Col  = process.env.GOOGLE_GROUPS_TEAM1_SCORE_COLUMN || "N";
-    const score2Col  = process.env.GOOGLE_GROUPS_TEAM2_SCORE_COLUMN || "O";
-    const rankCol    = "Z";
-    const playerCol  = "AA";
-    const winsCol    = "AB";
-    const lossesCol  = "AC";
-    const pfCol      = "AD";
-    const paCol      = "AE";
-    const pdCol      = "AF";
-    const seedCol    = "AG";
+    const { player1Col, player2Col, score1Col, score2Col, rankCol, dateCol,
+            timeCol, refCol,
+            playerCol, winsCol, lossesCol, pfCol, paCol, pdCol, seedCol } = GROUPS_SHEET_COLS;
+
+    // Sheet 1 (Schedule) columns that hold date, time, referee per match row.
+    const sourceDateCol = process.env.GOOGLE_SHEETS_DATE_COLUMN || "E";
+    const sourceTimeCol = process.env.GOOGLE_SHEETS_TIME_COLUMN || "F";
+    const sourceRefCol  = process.env.GOOGLE_SHEETS_REFEREE_COLUMN || "J";
 
     const sheets = getSheetsClient();
 
-    const response = await sheets.spreadsheets.values.get({
-        spreadsheetId,
-        range: `${sheetName}!D1:AG`,
-    });
-    const rows = response.data.values || [];
-
-    // Find each group's starting row by locating "X1" lobby codes in column G
-    // (col G is index 3 within the D:AG range).
-    const groups = [];
-    for (let i = 0; i < rows.length; i++) {
-        const cell = String(rows[i][3] || "").trim().toUpperCase();
-        if (/^[A-Z]1$/.test(cell)) {
-            groups.push({ letter: cell[0], startIndex: i });
-        }
-    }
-
-    if (groups.length === 0) {
-        throw new Error(
-            `No groups found. Make sure lobby codes like "A1", "B1" are in column ${lobbyCol} of "${sheetName}".`
-        );
-    }
-
-    // Reusable IMPORTRANGE snippets. Sheets caches these by argument pair,
-    // so repeating the same IMPORTRANGE across many cells is cheap.
     const ir = (col) => `IMPORTRANGE("${sourceSpreadsheetId}","${sourceTabName}!${col}:${col}")`;
     const irP1 = ir(sourceP1Col);
     const irP2 = ir(sourceP2Col);
     const irS1 = ir(sourceS1Col);
     const irS2 = ir(sourceS2Col);
+    const irDate = ir(sourceDateCol);
+    const irTime = ir(sourceTimeCol);
+    const irRef  = ir(sourceRefCol);
 
-    // Capture each group's current player names (col AA = idx 23 within D:AG)
-    // and seeds (col AG = idx 29) BEFORE we clear the cells — these become
-    // constants inside the sort formula so players stay tied to their seeds.
     const escapeLit = (s) => `"${String(s).replace(/"/g, '""')}"`;
-    const groupDetails = groups.map((g) => {
-        const players = [];
-        const seeds = [];
-        for (let i = 0; i < 4; i++) {
-            const row = rows[g.startIndex + i] || [];
-            const name = String(row[23] || "").trim();
-            const seedRaw = String(row[29] || "").trim();
-            const seedNum = parseInt(seedRaw.replace(/^#/, ""), 10);
-            players.push(name);
-            seeds.push(Number.isFinite(seedNum) ? seedNum : 99);
-        }
-        return { ...g, players, seeds };
-    });
 
     const updates = [];
-    const pdCellRanges = [];      // sheet-row ranges to number-format (PD)
-    const highlightRanges = [];   // sheet-row ranges for top-2 pink highlight
+    const pdCellRanges = [];
+    const highlightRanges = [];
 
-    for (const { letter, startIndex, players, seeds } of groupDetails) {
-        const startRow = startIndex + 1;
+    for (const { letter, startRow, lobbyCodes, players, seeds } of groupDetails) {
         pdCellRanges.push({ startRow, endRow: startRow + 4 });
-        highlightRanges.push({ startRow, endRow: startRow + 2 }); // top 2 rows
+        highlightRanges.push({ startRow, endRow: startRow + 2 });
 
         // ── SCORE COLUMNS N / O ────────────────────────────────────────────
         for (let offset = 0; offset < 6; offset++) {
             const r = startRow + offset;
-            const lobby = String(rows[startIndex + offset]?.[3] || "").trim();
+            const lobby = lobbyCodes[offset] || "";
             if (!lobby) continue;
 
             const pl1 = `${player1Col}${r}`;
@@ -793,6 +894,28 @@ export async function setupStandingsFormulas() {
             updates.push({
                 range: `${sheetName}!${score1Col}${r}:${score2Col}${r}`,
                 values: [[`=${lookupT1}`, `=${lookupT2}`]],
+            });
+
+            // ── DATE / TIME / REFEREE (cols H, I, Q) ───────────────────────
+            // These pull from Sheet 1 by cross-referencing the pair of
+            // players in M/P, matching either G/H ordering on Schedule.
+            // Empty string fallback so unplayed/unscheduled matches stay blank.
+            const lookupDateTimeRef = (sourceIr) =>
+                `IFERROR(IFNA(` +
+                `FILTER(${sourceIr},${irP1}=${pl1},${irP2}=${pl2}),` +
+                `FILTER(${sourceIr},${irP1}=${pl2},${irP2}=${pl1})),"")`;
+
+            updates.push({
+                range: `${sheetName}!${dateCol}${r}`,
+                values: [[`=${lookupDateTimeRef(irDate)}`]],
+            });
+            updates.push({
+                range: `${sheetName}!${timeCol}${r}`,
+                values: [[`=${lookupDateTimeRef(irTime)}`]],
+            });
+            updates.push({
+                range: `${sheetName}!${refCol}${r}`,
+                values: [[`=${lookupDateTimeRef(irRef)}`]],
             });
         }
 
@@ -816,15 +939,36 @@ export async function setupStandingsFormulas() {
             `O_,${o},` +
             `PL,${PL},` +
             `SD,${SD},` +
-            `WN,MAP(PL,LAMBDA(pn,COUNTIFS(M_,pn,N_,">=5")+COUNTIFS(P_,pn,O_,">=5"))),` +
-            `LS,MAP(PL,LAMBDA(pn,COUNTIFS(M_,pn,O_,">=5")+COUNTIFS(P_,pn,N_,">=5"))),` +
-            `PFS,MAP(PL,LAMBDA(pn,SUMIF(M_,pn,N_)+SUMIF(P_,pn,O_))),` +
-            `PAS,MAP(PL,LAMBDA(pn,SUMIF(M_,pn,O_)+SUMIF(P_,pn,N_))),` +
-            // Compute PD directly with MAP. Doing `PFS-PAS` across two
-            // LET-bound MAP results doesn't reliably produce an array — it
-            // collapses to a scalar and HSTACK pads the column with #N/A,
-            // which then poisons the sort's PD tiebreaker and breaks ranks.
-            `PDS,MAP(PL,LAMBDA(pn,SUMIF(M_,pn,N_)+SUMIF(P_,pn,O_)-SUMIF(M_,pn,O_)-SUMIF(P_,pn,N_))),` +
+            // effS(self, opp) → effective score accounting for forfeits.
+            // Forfeits are marked as 0/-1 in N/O so the sheet can still
+            // display the raw forfeit; for standings we translate to 5-0.
+            // The LAMBDA is called per-scalar inside nested MAP, which
+            // iterates reliably — doing the IF as `effN,IF(N_<0,...)` in a
+            // LET binding collapses to a scalar and poisons every stat.
+            `effS,LAMBDA(self,opp,IF(self<0,0,IF(opp<0,5,self))),` +
+            // Win: own effective score ≥ 5. Loss: opponent's ≥ 5.
+            // Each stat is computed via MAP(M_,N_,O_,LAMBDA(m,n,o,…))
+            // summed over the 6 match rows.
+            `WN,MAP(PL,LAMBDA(pn,` +
+                `SUM(MAP(M_,N_,O_,LAMBDA(m,n,o,(m=pn)*(effS(n,o)>=5))))` +
+                `+SUM(MAP(P_,N_,O_,LAMBDA(p,n,o,(p=pn)*(effS(o,n)>=5))))` +
+            `)),` +
+            `LS,MAP(PL,LAMBDA(pn,` +
+                `SUM(MAP(M_,N_,O_,LAMBDA(m,n,o,(m=pn)*(effS(o,n)>=5))))` +
+                `+SUM(MAP(P_,N_,O_,LAMBDA(p,n,o,(p=pn)*(effS(n,o)>=5))))` +
+            `)),` +
+            `PFS,MAP(PL,LAMBDA(pn,` +
+                `SUM(MAP(M_,N_,O_,LAMBDA(m,n,o,(m=pn)*effS(n,o))))` +
+                `+SUM(MAP(P_,N_,O_,LAMBDA(p,n,o,(p=pn)*effS(o,n))))` +
+            `)),` +
+            `PAS,MAP(PL,LAMBDA(pn,` +
+                `SUM(MAP(M_,N_,O_,LAMBDA(m,n,o,(m=pn)*effS(o,n))))` +
+                `+SUM(MAP(P_,N_,O_,LAMBDA(p,n,o,(p=pn)*effS(n,o))))` +
+            `)),` +
+            `PDS,MAP(PL,LAMBDA(pn,` +
+                `SUM(MAP(M_,N_,O_,LAMBDA(m,n,o,(m=pn)*(effS(n,o)-effS(o,n)))))` +
+                `+SUM(MAP(P_,N_,O_,LAMBDA(p,n,o,(p=pn)*(effS(o,n)-effS(n,o)))))` +
+            `)),` +
             `TBL,HSTACK(PL,WN,LS,PFS,PAS,PDS,SD),` +
             `ST,SORT(TBL,2,FALSE,6,FALSE,4,FALSE,7,TRUE),` +
             `SW,INDEX(ST,0,2),SPD,INDEX(ST,0,6),SPF,INDEX(ST,0,4),` +
@@ -934,5 +1078,134 @@ export async function setupStandingsFormulas() {
         console.warn(`⚠️ Fórmulas escritas, mas não consegui aplicar formatação: ${err.message ?? err}`);
     }
 
-    return { groups: groups.length, updatesWritten: updates.length };
+    return { groups: groupDetails.length, updatesWritten: updates.length };
+}
+
+export async function setupStandingsFormulas() {
+    const groupDetails = await readGroupDetails();
+    if (groupDetails.length === 0) {
+        throw new Error(
+            `No groups found. Make sure lobby codes like "A1", "B1" are in column ${GROUPS_SHEET_COLS.lobbyCol} of the groups schedule tab.`
+        );
+    }
+    return writeGroupStandingsFormulas(groupDetails);
+}
+
+/**
+ * Reorders groups within each division (Dreamers = A-D, Mischiefs = E-H)
+ * by average seed — lower seeds first. Group A ends up with the best avg
+ * seed within Dreamers; Group D with the worst. Same for E→H in Mischiefs.
+ *
+ * Safety notes:
+ *  - Sheet 1 (Schedule) is NEVER touched. Player rows, refs, and match tabs
+ *    all stay put there. The reschedule/ref/score flows use name-based
+ *    lookups so they keep working after a reorder.
+ *  - Only Sheet 2 changes: per physical group position, the match-row data
+ *    (cols M/P across 6 rows) and standings constants (AA/AG across 4 rows)
+ *    are swapped in. Lobby codes (col G) and group-letter labels stay fixed
+ *    at their positions — so "A1" still refers to the top-left match cell,
+ *    it just now has the newly-ranked Group A's matchup.
+ *  - Tiebreaker for equal avg seeds: the group with the lowest single seed
+ *    (best solo player) wins.
+ *  - Idempotent: running it twice produces no changes the second time.
+ *
+ * @returns {Promise<{ dreamers: Array<{position: string, from: string, avgSeed: number}>,
+ *                     mischiefs: Array<{position: string, from: string, avgSeed: number}>,
+ *                     swapped: number }>}
+ */
+export async function resortGroupsBySeed() {
+    const groupDetails = await readGroupDetails();
+    if (groupDetails.length === 0) {
+        throw new Error(
+            `No groups found. Make sure lobby codes like "A1", "B1" are in column ${GROUPS_SHEET_COLS.lobbyCol} of the groups schedule tab.`
+        );
+    }
+
+    const spreadsheetId = process.env.GOOGLE_GROUPS_SHEETS_ID || DEFAULT_GROUPS_SPREADSHEET_ID;
+    const sheetName = process.env.GOOGLE_GROUPS_TAB_NAME || DEFAULT_GROUPS_TAB_NAME;
+    const { player1Col, player2Col } = GROUPS_SHEET_COLS;
+
+    // Compute avg seed + min seed per group for sorting.
+    const withStats = groupDetails.map((g) => ({
+        ...g,
+        avgSeed: g.seeds.reduce((a, b) => a + b, 0) / g.seeds.length,
+        minSeed: Math.min(...g.seeds),
+    }));
+
+    const DIVISIONS = [
+        { name: "dreamers", letters: ["A", "B", "C", "D"] },
+        { name: "mischiefs", letters: ["E", "F", "G", "H"] },
+    ];
+
+    // For each division, determine the "position letter → source group letter" mapping.
+    // Then rebuild groupDetails with each physical position receiving the data
+    // of its newly-assigned source group.
+    const rebuilt = new Map(); // letter → rebuilt groupDetail
+    const summary = { dreamers: [], mischiefs: [], swapped: 0 };
+
+    for (const { name, letters } of DIVISIONS) {
+        const originals = withStats.filter((g) => letters.includes(g.letter));
+        if (originals.length === 0) continue;
+
+        const sorted = [...originals].sort((a, b) => {
+            if (a.avgSeed !== b.avgSeed) return a.avgSeed - b.avgSeed;
+            return a.minSeed - b.minSeed;
+        });
+
+        for (let pos = 0; pos < sorted.length; pos++) {
+            const positionLetter = letters[pos];
+            const source = sorted[pos];
+            const positionOriginal = originals.find((g) => g.letter === positionLetter);
+            if (!positionOriginal) continue;
+
+            // Physical position keeps its own letter / startRow / lobbyCodes,
+            // but takes the source group's players, seeds, and match-row data.
+            rebuilt.set(positionLetter, {
+                letter: positionLetter,
+                startIndex: positionOriginal.startIndex,
+                startRow: positionOriginal.startRow,
+                lobbyCodes: positionOriginal.lobbyCodes,
+                matchRows: source.matchRows,
+                players: source.players,
+                seeds: source.seeds,
+            });
+
+            if (source.letter !== positionLetter) summary.swapped += 1;
+            summary[name].push({
+                position: positionLetter,
+                from: source.letter,
+                avgSeed: Number(source.avgSeed.toFixed(2)),
+            });
+        }
+    }
+
+    // Assemble the new groupDetails list in original order (so the writer's
+    // clear-then-write loop covers all of them).
+    const newGroupDetails = groupDetails.map((g) => rebuilt.get(g.letter) || g);
+
+    // STEP 1: overwrite match-row data (cols M, P across 6 rows per group).
+    // We use RAW so player names can't accidentally be parsed as formulas.
+    const mpUpdates = [];
+    for (const g of newGroupDetails) {
+        for (let i = 0; i < 6; i++) {
+            const r = g.startRow + i;
+            const mVal = g.matchRows[i]?.m ?? "";
+            const pVal = g.matchRows[i]?.p ?? "";
+            mpUpdates.push({ range: `${sheetName}!${player1Col}${r}`, values: [[mVal]] });
+            mpUpdates.push({ range: `${sheetName}!${player2Col}${r}`, values: [[pVal]] });
+        }
+    }
+    if (mpUpdates.length > 0) {
+        const sheets = getSheetsClient();
+        await sheets.spreadsheets.values.batchUpdate({
+            spreadsheetId,
+            requestBody: { valueInputOption: "RAW", data: mpUpdates },
+        });
+    }
+
+    // STEP 2: regenerate standings formulas using the NEW players/seeds so
+    // each physical group's spill has the correct roster baked in.
+    await writeGroupStandingsFormulas(newGroupDetails);
+
+    return summary;
 }

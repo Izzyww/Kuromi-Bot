@@ -141,7 +141,8 @@ bancho.on("CM", async (message) => {
                 const tiebreakerPoint = pointsToWin - 1; 
 
                 let statusText = "";
-                let footerText = `🏆 Vencedor: ${winnerTeam} | Match ID: ${matchState.matchId}`;
+                const lobbyLabel = matchState.lobbyCode ? ` | Lobby: ${matchState.lobbyCode}` : "";
+                let footerText = `🏆 Vencedor: ${winnerTeam} | Match ID: ${matchState.matchId}${lobbyLabel}`;
 
                 // --- LÓGICA DE FIM DE JOGO ---
                 if (matchState.scoreRed >= pointsToWin) {
@@ -188,6 +189,7 @@ bancho.on("CM", async (message) => {
                     }
                 );
 
+
             } else {
                 // Modo Solo
                 const winner = allScores[0];
@@ -224,7 +226,7 @@ bancho.on("CM", async (message) => {
     }
 });
 
-export async function trackMatch(matchId, discordChannel, bestOf = 13) {
+export async function trackMatch(matchId, discordChannel, bestOf = 13, lobbyCode = null) {
     const channelName = `#mp_${matchId}`;
 
     // Se já estiver monitorando essa sala, avisa e não faz nada
@@ -243,7 +245,8 @@ export async function trackMatch(matchId, discordChannel, bestOf = 13) {
             matchId: matchId,
             scoreBlue: 0,
             scoreRed: 0,
-            bestOf: bestOf 
+            bestOf: bestOf,
+            lobbyCode: lobbyCode ? lobbyCode.trim().toUpperCase() : null,
         });
 
         return true; 

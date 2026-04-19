@@ -2,7 +2,7 @@ import dotenv from "dotenv";
 import { Client, IntentsBitField, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } from "discord.js";
 import utils from "./utils.js";
 import { trackMatch } from "./osuTracker.js";
-import { setupStandingsFormulas, updateLobbyDateTime, updateLobbyReferee, syncGroupStandings, updateLobbySeriesScore } from "./googleSheets.js";
+import { setupStandingsFormulas, resortGroupsBySeed, updateLobbyDateTime, updateLobbyReferee, syncGroupStandings, updateLobbySeriesScore } from "./googleSheets.js";
 
 dotenv.config();
 const REFEREE_ROLE_ID = "1157479282700992552";
@@ -286,6 +286,53 @@ client.on("interactionCreate", async (interaction) => {
             } catch (error) {
                 console.error("Erro ao configurar fórmulas de standings:", error);
                 await interaction.editReply(`❌ Não consegui configurar as fórmulas: ${error.message}`);
+            }
+        }
+
+        if (interaction.commandName === "resort-groups") {
+            const hasRefereeRole = interaction.member?.roles?.cache?.has(REFEREE_ROLE_ID);
+
+            if (!hasRefereeRole) {
+                await interaction.reply({
+                    content: "🚫 Apenas usuários com o cargo de referee podem usar este comando.",
+                    ephemeral: true,
+                });
+                return;
+            }
+
+            await interaction.deferReply({ ephemeral: true });
+
+            try {
+                const result = await resortGroupsBySeed();
+
+                const fmtDivision = (name, entries) => {
+                    if (entries.length === 0) return null;
+                    const lines = entries
+                        .map((e) => {
+                            const arrow = e.position === e.from ? "=" : "←";
+                            return `• **${e.position}** ${arrow} ${e.from}  _(avg seed ${e.avgSeed})_`;
+                        })
+                        .join("\n");
+                    return `__**${name}**__\n${lines}`;
+                };
+
+                const parts = [
+                    fmtDivision("Dreamers", result.dreamers),
+                    fmtDivision("Mischiefs", result.mischiefs),
+                ].filter(Boolean);
+
+                if (result.swapped === 0) {
+                    await interaction.editReply("ℹ️ Os grupos já estão ordenados por avg seed. Nada a mudar.");
+                } else {
+                    await interaction.editReply(
+                        `✅ Grupos reordenados (${result.swapped} posições trocadas).\n\n` +
+                        parts.join("\n\n") +
+                        `\n\nAs fórmulas de standings foram regeneradas com os novos rosters.`
+                    );
+                }
+            } catch (error) {
+                console.error("Erro ao reordenar grupos:", error);
+                await interaction.editReply(`❌ Não consegui reordenar os grupos: ${error.message}`);
             }
         }
     }

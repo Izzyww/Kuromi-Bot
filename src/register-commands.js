@@ -136,6 +136,11 @@ const commands = [
         description: "Escreve fórmulas de standings na sheet 2 (roda uma vez, funciona sem o bot online)",
         default_member_permissions: "0",
     },
+    {
+        name: "resort-groups",
+        description: "Reordena grupos (A-D Dreamers, E-H Mischiefs) por avg seed — menor seed = grupo A/E",
+        default_member_permissions: "0",
+    },
 ];
 
 const rest = new REST({ version: 10 }).setToken(process.env.TOKEN);

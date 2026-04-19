@@ -80,11 +80,46 @@ function formatDatetime(value) {
     return date.format("DD/MM/YYYY HH:mm");
 }
 
+const weekdaysPtShort = ["Dom", "Seg", "Ter", "Qua", "Qui", "Sex", "Sáb"];
+const monthsPtShort = ["Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez"];
+
+/**
+ * Converts DD/MM or DD/MM/YYYY to "(Dom) Abr 26".
+ * @param {string} value
+ * @returns {string}
+ */
+function formatDateForSheet(value) {
+    const match = value.match(/^(\d{1,2})\/(\d{1,2})(?:\/(\d{4}))?$/);
+    if (!match) {
+        return value;
+    }
+
+    const day = Number(match[1]);
+    const month = Number(match[2]);
+    const year = Number(match[3] || new Date().getFullYear());
+    const date = new Date(year, month - 1, day);
+
+    if (
+        date.getFullYear() !== year
+        || date.getMonth() !== month - 1
+        || date.getDate() !== day
+    ) {
+        return value;
+    }
+
+    const weekday = weekdaysPtShort[date.getDay()];
+    const monthLabel = monthsPtShort[month - 1];
+    const dayLabel = String(day).padStart(2, "0");
+
+    return `(${weekday}) ${monthLabel} ${dayLabel}`;
+}
+
 const utils = {
     appendSection,
     validateDate,
     validateTime,
     formatDatetime,
+    formatDateForSheet,
 };
 
 export default utils;
