@@ -22,6 +22,14 @@ const commands = [
                 required: true,
             },
             {
+                name: "first_pick",
+                description: "Quem fez o primeiro pick: 1 = primeiro nome em (A) vs (B), 2 = segundo",
+                type: ApplicationCommandOptionType.Integer,
+                required: true,
+                min_value: 1,
+                max_value: 2,
+            },
+            {
                 name: "lobby",
                 description: "Código da lobby para sync na planilha (ex.: B1)",
                 type: ApplicationCommandOptionType.String,
@@ -142,6 +150,50 @@ const commands = [
         name: "sync-ids",
         description: "Atualiza a coluna ID da ref sheet (col I) com os códigos atuais (A1, D3...) da sheet 2",
         default_member_permissions: "0",
+    },
+    {
+        name: "setup-mp-vod-links",
+        description: "Escreve fórmulas nas colunas S e T (links MP/VOD) da sheet principal a partir da Schedule",
+        default_member_permissions: "0",
+        options: [
+            {
+                name: "primeira_linha",
+                description: "Primeira linha com fórmulas (default 4 ou GOOGLE_GROUPS_LINK_FORMULAS_START_ROW)",
+                type: ApplicationCommandOptionType.Integer,
+                required: false,
+                min_value: 1,
+            },
+            {
+                name: "quantidade_linhas",
+                description: "Quantas linhas preencher (default 500 ou GOOGLE_GROUPS_LINK_FORMULAS_ROW_COUNT, máx 3000)",
+                type: ApplicationCommandOptionType.Integer,
+                required: false,
+                min_value: 1,
+                max_value: 3000,
+            },
+        ],
+    },
+    {
+        name: "sync-mp-vod-squares",
+        description: "Main sheet: colunas S e T com ■ hiperligados (ref Schedule O/Q, cores por grupo)",
+        default_member_permissions: "0",
+        options: [
+            {
+                name: "primeira_linha",
+                description: "Primeira linha (default 4 ou GOOGLE_GROUPS_LINK_FORMULAS_START_ROW)",
+                type: ApplicationCommandOptionType.Integer,
+                required: false,
+                min_value: 1,
+            },
+            {
+                name: "quantidade_linhas",
+                description: "Quantas linhas (default 500 ou GOOGLE_GROUPS_LINK_FORMULAS_ROW_COUNT, máx 3000)",
+                type: ApplicationCommandOptionType.Integer,
+                required: false,
+                min_value: 1,
+                max_value: 3000,
+            },
+        ],
     },
 ];
 

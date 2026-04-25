@@ -2,7 +2,7 @@ import dotenv from "dotenv";
 import { Client, IntentsBitField, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } from "discord.js";
 import utils from "./utils.js";
 import { trackMatch } from "./osuTracker.js";
-import { setupStandingsFormulas, resortGroupsBySeed, syncScheduleIds, updateLobbyDateTime, updateLobbyReferee, syncGroupStandings, updateLobbySeriesScore } from "./googleSheets.js";
+import { setupStandingsFormulas, resortGroupsBySeed, syncScheduleIds, updateLobbyDateTime, updateLobbyReferee, syncGroupStandings, updateLobbySeriesScore, loadMappoolBeatmapSlotLookup, applyGroupsSheetMpVodLinkFormulas, applyGroupsMpVodSquareHyperlinksFromSchedule } from "./googleSheets.js";
 import { startRefereeReminders } from "./refScheduler.js";
 
 dotenv.config();
@@ -113,21 +113,52 @@ client.on("interactionCreate", async (interaction) => {
             const matchId = interaction.options.getInteger("id");
             const bestOf = interaction.options.getInteger("best_of") || 13; 
             const lobby = interaction.options.getString("lobby")?.trim().toUpperCase() || null;
+            const firstPick = interaction.options.getInteger("first_pick");
+            if (firstPick == null) {
+                await interaction.reply({
+                    content: "O parâmetro **first_pick** é obrigatório (1 ou 2).",
+                    ephemeral: true,
+                });
+                return;
+            }
             
             // 1. Avisa o Discord que vamos processar (Isso gera o "Pensando...")
             await interaction.deferReply({ ephemeral: true });
     
             try {
-                // Tenta rodar a função. Se der erro AQUI DENTRO, ele pula pro 'catch'
-                const success = await trackMatch(matchId, interaction.channel, bestOf, lobby, interaction.user);
+                let slotMap = new Map();
+                try {
+                    slotMap = await loadMappoolBeatmapSlotLookup();
+                } catch (sheetErr) {
+                    console.error("Mappool (planilha):", sheetErr.message ?? sheetErr);
+                }
+
+                const result = await trackMatch(
+                    matchId,
+                    interaction.channel,
+                    bestOf,
+                    lobby,
+                    interaction.user,
+                    slotMap,
+                    firstPick
+                );
     
-                if (success) {
+                if (result?.ok) {
                     const pointsToWin = Math.ceil(bestOf / 2);
                     const lobbyText = lobby ? ` | Lobby: **${lobby}**` : "";
-                    await interaction.editReply(`✅ Monitorando MP **${matchId}** (Melhor de ${bestOf} - Ganha com ${pointsToWin})${lobbyText}.`);
+                    if (result.postedRecap) {
+                        await interaction.editReply(
+                            `✅ Sala **${matchId}** já estava encerrada — enviei o **Pick Recap** no canal.${lobbyText}`
+                        );
+                    } else {
+                        await interaction.editReply(
+                            `✅ Monitorando MP **${matchId}** (Melhor de ${bestOf} — ganha com ${pointsToWin}).${lobbyText}`
+                        );
+                    }
                 } else {
-                    // Se o trackMatch retornar false (ex: sala não existe ou já está monitorando)
-                    await interaction.editReply(`❌ Não consegui entrar na sala **${matchId}**. Verifique se ela existe, se a senha do IRC está certa ou se eu já estou nela.`);
+                    await interaction.editReply(
+                        `❌ Não consegui processar a MP **${matchId}** (sala inexistente, erro ao enviar, ou já estou monitorando esta MP).`
+                    );
                 }
     
             } catch (error) {
@@ -370,6 +401,73 @@ client.on("interactionCreate", async (interaction) => {
             } catch (error) {
                 console.error("Erro ao sincronizar IDs:", error);
                 await interaction.editReply(`❌ Não consegui sincronizar IDs: ${error.message}`);
+            }
+        }
+
+        if (interaction.commandName === "setup-mp-vod-links") {
+            const hasRefereeRole = interaction.member?.roles?.cache?.has(REFEREE_ROLE_ID);
+
+            if (!hasRefereeRole) {
+                await interaction.reply({
+                    content: "🚫 Apenas usuários com o cargo de referee podem usar este comando.",
+                    ephemeral: true,
+                });
+                return;
+            }
+
+            await interaction.deferReply({ ephemeral: true });
+
+            try {
+                const primeira = interaction.options.getInteger("primeira_linha");
+                const quantidade = interaction.options.getInteger("quantidade_linhas");
+                const result = await applyGroupsSheetMpVodLinkFormulas({
+                    startRow: primeira ?? undefined,
+                    rowCount: quantidade ?? undefined,
+                });
+                const zeroHint =
+                    result.rowsWritten === 0
+                        ? `\n\n⚠️ Nenhuma linha na coluna **${result.lobbyColumn}** neste intervalo parece um lobby (\`A1\`, \`B2\`, …). Confirma **GOOGLE_GROUPS_LOBBY_COLUMN** / **GOOGLE_GROUPS_MP_LINK_COLUMN** / **GOOGLE_GROUPS_VOD_LINK_COLUMN** no \`.env\` (layout compacto: lobby **B**, MP **I**, VOD **J**). Ajusta também **primeira_linha** / **quantidade_linhas**.`
+                        : "";
+                await interaction.editReply(
+                    `✅ Intervalo **${result.startRow}**–**${result.endRow}** (${result.scannedRows} linhas lidas em **${result.lobbyColumn}**). ` +
+                    `**${result.rowsWritten}** linhas com lobby → fórmulas em **${result.mpColumn}**/**${result.vodColumn}**.` +
+                    zeroHint +
+                    `\n\nSe a ref sheet está noutro ficheiro, abre a planilha e autoriza o **IMPORTRANGE** na primeira célula MP/VOD se o Sheets pedir.`
+                );
+            } catch (error) {
+                console.error("Erro ao configurar links MP/VOD:", error);
+                await interaction.editReply(`❌ Não consegui escrever as fórmulas: ${error.message}`);
+            }
+        }
+
+        if (interaction.commandName === "sync-mp-vod-squares") {
+            const hasRefereeRole = interaction.member?.roles?.cache?.has(REFEREE_ROLE_ID);
+
+            if (!hasRefereeRole) {
+                await interaction.reply({
+                    content: "🚫 Apenas usuários com o cargo de referee podem usar este comando.",
+                    ephemeral: true,
+                });
+                return;
+            }
+
+            await interaction.deferReply({ ephemeral: true });
+
+            try {
+                const primeira = interaction.options.getInteger("primeira_linha");
+                const quantidade = interaction.options.getInteger("quantidade_linhas");
+                const result = await applyGroupsMpVodSquareHyperlinksFromSchedule({
+                    startRow: primeira ?? undefined,
+                    rowCount: quantidade ?? undefined,
+                });
+                await interaction.editReply(
+                    `✅ **Sincronizados** ■ em **${result.squareMpColumn}** / **${result.squareVodColumn}** (linhas **${result.startRow}**–**${result.endRow}**). ` +
+                    `Hiperligações: **${result.hyperlinksSet}** · células limpas (sem URL na ref): **${result.cellsCleared}** · pedidos de grid: **${result.requestCount}**.\n` +
+                    `Ref: col **O** = MP, **Q** = VOD, **I** = lobby. Usa \`/sync-ids\` se o **I** não bater.`
+                );
+            } catch (error) {
+                console.error("Erro sync-mp-vod-squares:", error);
+                await interaction.editReply(`❌ ${error.message}`);
             }
         }
     }

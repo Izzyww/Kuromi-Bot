@@ -1,0 +1,90 @@
+Google Sheets — MP / VOD link squares (main sheet)
+====================================================
+
+Bot: run slash command **/setup-mp-vod-links** (cargo referee) to write these
+formulas automatically. Optional: `primeira_linha`, `quantidade_linhas`, or env
+`GOOGLE_GROUPS_LINK_FORMULAS_START_ROW` / `GOOGLE_GROUPS_LINK_FORMULAS_ROW_COUNT`.
+
+**Column layout (important)** — defaults assume lobby in **G** and links in **S**/**T**
+(legacy wide layout). The **compact** groups tab (e.g. Kuruwumi MAIN) often has:
+lobby in **B**, **MP** in **I**, **VOD** in **J**. Set in `.env`:
+
+  GOOGLE_GROUPS_LOBBY_COLUMN=B
+  GOOGLE_GROUPS_PLAYER1_COLUMN=E
+  GOOGLE_GROUPS_PLAYER2_COLUMN=H
+  GOOGLE_GROUPS_MP_LINK_COLUMN=I
+  GOOGLE_GROUPS_VOD_LINK_COLUMN=J
+
+Ref spreadsheet ID (sheet 1): `1TfnvPfggLgjgf8KjOQFTVcpkqRso1u55AT5e0sS8FTY`  
+Main / groups spreadsheet ID: `18kTX8-XpCy0D37ez7tV-yg_UBTdJLkxvwXiDIHWeLBU`  
+(`GOOGLE_SHEETS_ID` = ref, `GOOGLE_GROUPS_SHEETS_ID` = main — different → **IMPORTRANGE**.)
+
+The bot only writes rows where the **lobby** column looks like a lobby (`A1`, `B2`, …)
+so blank lobby cells (e.g. subheaders) are not overwritten.
+
+If formulas show **#ERROR!** in PT/EU locales, set env **`GOOGLE_SHEETS_FORMULA_ARG_SEP=;`**
+(comma vs semicolon as the function-argument separator).
+
+**Reschedules / sync-ids** read the main tab with a fixed range **`B1:H5000`**-style
+(`GOOGLE_GROUPS_MAIN_SCAN_END_ROW`, default `5000`) so row order matches the API.
+Set **`GOOGLE_GROUPS_SHEETS_ID`** to your main file ID if it’s not the default.
+
+IMPORTANT: Ref sheet “Schedule”: O = MP, P = VOD, match tab name in Q (bot default).
+Override with env GOOGLE_SHEETS_MATCH_TAB_COLUMN if your tab column differs.
+
+Match key: main sheet lobby code (column **G** by default, or **B** on compact layout)
+must match Ref sheet **Schedule** column **I** (sync with `/sync-ids` / bot).
+
+Ref sheet (Schedule): column O = MP URL, column P = VOD URL.
+Data should start at row 2 if row 1 is headers (adjust I2:P if needed).
+
+Display: clickable ■ (change the last argument of HYPERLINK if you prefer another symbol).
+Empty cell when G is blank or no matching row / no URL (removes “design only” squares).
+
+--------------------------------------------------------------------
+OPTION A — Ref sheet is in a *different* spreadsheet (use IMPORTRANGE)
+--------------------------------------------------------------------
+
+1) Replace YOUR_REF_SPREADSHEET_ID with the Ref file ID from its URL:
+   https://docs.google.com/spreadsheets/d/<THIS_PART>/edit
+
+2) Replace "Schedule" if your ref tab name differs.
+
+3) First data row: if your table starts at row 3, change I2:P → I3:P everywhere below.
+
+--- Main sheet S4 (MP). Copy down column S for all match rows. ---
+=IF($G4="","",IFERROR(LET(data,IMPORTRANGE("YOUR_REF_SPREADSHEET_ID","Schedule!I2:P"),key,TRIM(UPPER($G4)),keys,TRIM(UPPER(INDEX(data,,1))),row,MATCH(key,keys,0),url,TRIM(INDEX(data,row,7)&""),IF(LEN(url),HYPERLINK(url,"■"),"")),""))
+
+--- Main sheet T4 (VOD). Copy down column T ---
+=IF($G4="","",IFERROR(LET(data,IMPORTRANGE("YOUR_REF_SPREADSHEET_ID","Schedule!I2:P"),key,TRIM(UPPER($G4)),keys,TRIM(UPPER(INDEX(data,,1))),row,MATCH(key,keys,0),url,TRIM(INDEX(data,row,8)&""),IF(LEN(url),HYPERLINK(url,"■"),"")),""))
+
+Note: First IMPORTRANGE in the file will ask you to “Allow access” — click Allow once.
+
+--------------------------------------------------------------------
+OPTION B — Same spreadsheet (Schedule tab in this file)
+--------------------------------------------------------------------
+
+--- S4 (MP) ---
+=IF($G4="","",IFERROR(LET(data,'Schedule'!I2:P,key,TRIM(UPPER($G4)),keys,TRIM(UPPER(INDEX(data,,1))),row,MATCH(key,keys,0),url,TRIM(INDEX(data,row,7)&""),IF(LEN(url),HYPERLINK(url,"■"),"")),""))
+
+--- T4 (VOD) ---
+=IF($G4="","",IFERROR(LET(data,'Schedule'!I2:P,key,TRIM(UPPER($G4)),keys,TRIM(UPPER(INDEX(data,,1))),row,MATCH(key,keys,0),url,TRIM(INDEX(data,row,8)&""),IF(LEN(url),HYPERLINK(url,"■"),"")),""))
+
+If the tab name has spaces or special chars, wrap it in quotes: 'My Schedule'!I2:P
+
+--------------------------------------------------------------------
+Group colors (purple / blue / orange / red)
+--------------------------------------------------------------------
+
+Formulas cannot set font color. After formulas work:
+- Use Conditional formatting on S:T keyed off column F (group letter) or row ranges,
+  OR set fill/text color manually per block to match your design.
+
+--------------------------------------------------------------------
+If your lobby ID on the Ref sheet is NOT column I
+--------------------------------------------------------------------
+
+Change the range to start at the lobby column, and fix the INDEX column numbers:
+  Lobby in column H → range H2:O (then MP is last col = INDEX(...,7) for O? count offset)
+
+Example: range I2:P → I is col 1, O is col 7, P is col 8 of that range (as used above).

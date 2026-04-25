@@ -4,8 +4,201 @@ import { google } from "googleapis";
 dotenv.config();
 
 let sheetsClient = null;
+
 const DEFAULT_GROUPS_SPREADSHEET_ID = "18kTX8-XpCy0D37ez7tV-yg_UBTdJLkxvwXiDIHWeLBU";
 const DEFAULT_GROUPS_TAB_NAME = "groups schedule";
+
+/** Ref sheet (Schedule): column with the match / referee tab name (was P, now Q). */
+function getScheduleMatchTabColumn() {
+    return process.env.GOOGLE_SHEETS_MATCH_TAB_COLUMN || "Q";
+}
+
+function scheduleMatchTabIndexFromG() {
+    const col = getScheduleMatchTabColumn().toUpperCase();
+    return col.charCodeAt(0) - "G".charCodeAt(0);
+}
+
+function scheduleMatchTabIndexFromD() {
+    const col = getScheduleMatchTabColumn().toUpperCase();
+    return col.charCodeAt(0) - "D".charCodeAt(0);
+}
+
+/** Ref sheet `Tab!I2:P` for LET / IMPORTRANGE (I=lobby, O=MP, P=VOD). */
+function scheduleRefRangeI2PForFormula() {
+    const refTab = process.env.GOOGLE_SHEETS_TAB_NAME || "Schedule";
+    if (/^[A-Za-z0-9_]+$/.test(refTab)) {
+        return `${refTab}!I2:P`;
+    }
+    return `'${refTab.replace(/'/g, "''")}'!I2:P`;
+}
+
+/** A1 range prefix: quote tab name when it has spaces or special characters. */
+function quoteSheetNameForA1(tabName) {
+    const s = String(tabName);
+    if (/^[A-Za-z0-9_]+$/.test(s)) return s;
+    return `'${s.replace(/'/g, "''")}'`;
+}
+
+/** 0-based column index: A=0, Z=25, AA=26, … */
+function columnLettersToIndex0(letters) {
+    const s = String(letters).replace(/[^A-Za-z]/g, "").toUpperCase();
+    if (!s) return 0;
+    let n = 0;
+    for (let i = 0; i < s.length; i += 1) {
+        n = n * 26 + (s.charCodeAt(i) - 64);
+    }
+    return n - 1;
+}
+
+function index0ToColumnLetters(index0) {
+    let n = index0 + 1;
+    let result = "";
+    while (n > 0) {
+        n -= 1;
+        result = String.fromCharCode(65 + (n % 26)) + result;
+        n = Math.floor(n / 26);
+    }
+    return result;
+}
+
+function normalizeColumnLetter(col) {
+    return String(col).replace(/\$/g, "").toUpperCase().replace(/[^A-Z]/g, "");
+}
+
+/**
+ * On the main groups tab, lobby + two player columns (legacy G/M/P, compact B/E/H, etc.):
+ * single range and slice indices for cross-ref with the ref Schedule.
+ */
+function groupsMainPlayerCrossRefSlice() {
+    const lobby = normalizeColumnLetter(process.env.GOOGLE_GROUPS_LOBBY_COLUMN || "G");
+    const p1 = normalizeColumnLetter(process.env.GOOGLE_GROUPS_PLAYER1_COLUMN || "M");
+    const p2 = normalizeColumnLetter(process.env.GOOGLE_GROUPS_PLAYER2_COLUMN || "P");
+    const i0 = columnLettersToIndex0(lobby);
+    const i1 = columnLettersToIndex0(p1);
+    const i2 = columnLettersToIndex0(p2);
+    const minI = Math.min(i0, i1, i2);
+    const maxI = Math.max(i0, i1, i2);
+    const minCol = index0ToColumnLetters(minI);
+    const maxCol = index0ToColumnLetters(maxI);
+    return {
+        minCol,
+        maxCol,
+        range: `${minCol}:${maxCol}`,
+        lobbyOff: i0 - minI,
+        p1Off: i1 - minI,
+        p2Off: i2 - minI,
+        lobby,
+        p1,
+        p2,
+    };
+}
+
+/** Default last row to scan on main (groups) tab; keeps API row index = sheet row. */
+function getGroupsMainScanEndRow() {
+    const n = parseInt(process.env.GOOGLE_GROUPS_MAIN_SCAN_END_ROW || "5000", 10);
+    return Math.min(20000, Math.max(20, n));
+}
+
+/** Trim lobby cell for match (NBSP, ZW, weird hyphens). */
+function normalizeMainLobbyKey(raw) {
+    return String(raw ?? "")
+        .replace(/[\s\u00A0\u2000-\u200B\u200C\u200D\uFEFF]+/g, "")
+        .replace(/[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D]/g, "-")
+        .toUpperCase();
+}
+
+/** `,` (US) vs `;` (many EU locales). Set `GOOGLE_SHEETS_FORMULA_ARG_SEP=;` if formulas show #ERROR!. */
+function getFormulaArgSeparator() {
+    const v = (process.env.GOOGLE_SHEETS_FORMULA_ARG_SEP || "").trim();
+    return v === ";" ? ";" : ",";
+}
+
+function buildMpVodCellFormula(row, dataExpr, urlColIndex, sep, lobbyCol) {
+    const lc = String(lobbyCol || "G").replace(/\$/g, "").toUpperCase();
+    const ref = `$${lc}${row}`;
+    const sq = "\u25a0"; // ■ — same as sheet-link-formulas.txt
+    const idxKeys = sep === ";" ? "INDEX(data;;1)" : "INDEX(data,,1)";
+    const idxUrl = sep === ";" ? `INDEX(data;row;${urlColIndex})` : `INDEX(data,row,${urlColIndex})`;
+    const matchExpr = sep === ";" ? "MATCH(key;keys;0)" : "MATCH(key,keys,0)";
+    const trimUrl = `TRIM(${idxUrl}&"")`;
+    const linkLine =
+        sep === ";"
+            ? `IF(LEN(url);HYPERLINK(url;"${sq}");"")`
+            : `IF(LEN(url),HYPERLINK(url,"${sq}"),"")`;
+    const letBody =
+        sep === ";"
+            ? `LET(data;${dataExpr};key;TRIM(UPPER(${ref}));keys;TRIM(UPPER(${idxKeys}));row;${matchExpr};url;${trimUrl};${linkLine})`
+            : `LET(data,${dataExpr},key,TRIM(UPPER(${ref})),keys,TRIM(UPPER(${idxKeys})),row,${matchExpr},url,${trimUrl},${linkLine})`;
+    const outer =
+        sep === ";" ? `IF(${ref}="";"";IFERROR(${letBody};""))` : `IF(${ref}="","",IFERROR(${letBody},""))`;
+    return `=${outer}`;
+}
+
+/** Expression used as `LET(data, …, …)` — same file uses range; else IMPORTRANGE. */
+function buildMpVodLetDataExpression() {
+    const groupsId = process.env.GOOGLE_GROUPS_SHEETS_ID || DEFAULT_GROUPS_SPREADSHEET_ID;
+    const refId = process.env.GOOGLE_SHEETS_ID;
+    const range = scheduleRefRangeI2PForFormula();
+    const sep = getFormulaArgSeparator();
+    if (!refId) {
+        throw new Error("GOOGLE_SHEETS_ID is not configured.");
+    }
+    if (refId === groupsId) {
+        return range;
+    }
+    return sep === ";" ? `IMPORTRANGE("${refId}";"${range}")` : `IMPORTRANGE("${refId}","${range}")`;
+}
+
+/** Pull beatmap id from a sheet cell (plain id or osu URL). */
+export function parseBeatmapIdFromCell(raw) {
+    if (raw == null) return null;
+    const s = String(raw).trim();
+    if (!s) return null;
+    const fromUrl =
+        s.match(/\/beatmaps\/(\d+)/i)?.[1] ||
+        s.match(/\/b\/(\d+)/i)?.[1] ||
+        s.match(/#osu\/(\d+)/i)?.[1];
+    if (fromUrl) return fromUrl;
+    if (/^\d+$/.test(s)) return s;
+    return null;
+}
+
+/**
+ * Reads Sheet 2 mappool: column N = beatmap id, H = slot label (NM1, HR1, …).
+ * @returns {Promise<Map<string, string>>} beatmapId → slot label
+ */
+export async function loadMappoolBeatmapSlotLookup() {
+    const sheets = getSheetsClient();
+    const spreadsheetId = process.env.GOOGLE_GROUPS_SHEETS_ID || DEFAULT_GROUPS_SPREADSHEET_ID;
+    const tab = process.env.MAPPOOL_TAB_NAME || "mappool";
+    const slotColumn = process.env.MAPPOOL_SLOT_COLUMN || "H";
+    const idColumn = process.env.MAPPOOL_BEATMAP_ID_COLUMN || "N";
+
+    const [slotRes, idRes] = await Promise.all([
+        sheets.spreadsheets.values.get({
+            spreadsheetId,
+            range: `${tab}!${slotColumn}2:${slotColumn}5000`,
+        }),
+        sheets.spreadsheets.values.get({
+            spreadsheetId,
+            range: `${tab}!${idColumn}2:${idColumn}5000`,
+        }),
+    ]);
+
+    const slots = slotRes.data.values || [];
+    const ids = idRes.data.values || [];
+    const map = new Map();
+    const rowCount = Math.max(slots.length, ids.length);
+
+    for (let i = 0; i < rowCount; i += 1) {
+        const slot = String(slots[i]?.[0] ?? "").trim();
+        const idRaw = ids[i]?.[0];
+        const bid = parseBeatmapIdFromCell(idRaw);
+        if (bid && slot) map.set(bid, slot);
+    }
+
+    return map;
+}
 
 export function getSheetsClient() {
     if (sheetsClient) {
@@ -34,8 +227,11 @@ export function getSheetsClient() {
 }
 
 async function findLobbyRow(sheets, spreadsheetId, sheetName, lobbyColumn, lobbyCode) {
-    const normalizedLobby = lobbyCode.trim().toUpperCase();
-    const getRange = `${sheetName}!${lobbyColumn}:${lobbyColumn}`;
+    const normalizedLobby = normalizeMainLobbyKey(lobbyCode);
+    const endRow = getGroupsMainScanEndRow();
+    const tab = quoteSheetNameForA1(sheetName);
+    const col = normalizeColumnLetter(lobbyColumn);
+    const getRange = `${tab}!${col}1:${col}${endRow}`;
     const response = await sheets.spreadsheets.values.get({
         spreadsheetId,
         range: getRange,
@@ -44,8 +240,8 @@ async function findLobbyRow(sheets, spreadsheetId, sheetName, lobbyColumn, lobby
     const rows = response.data.values || [];
 
     for (let index = 0; index < rows.length; index += 1) {
-        const value = (rows[index]?.[0] || "").trim().toUpperCase();
-        if (value === normalizedLobby) {
+        const value = normalizeMainLobbyKey(rows[index]?.[0] || "");
+        if (value && value === normalizedLobby) {
             return index + 1;
         }
     }
@@ -65,11 +261,12 @@ async function findLobbyRow(sheets, spreadsheetId, sheetName, lobbyColumn, lobby
  *   J = referee
  *   M = team 1 score
  *   N = team 2 score
- *   P = match tab name
+ *   O = MP link, P = VOD link
+ *   Q = match / referee tab name (GOOGLE_SHEETS_MATCH_TAB_COLUMN, default Q)
  *
- * Sheet 2 (groups schedule):
- *   G = lobby code ("A1" etc.), H = date, I = time, M = player 1, P = player 2,
- *   N = team 1 score, O = team 2 score, Q = referee, Z:AG = standings block.
+ * Sheet 2 (groups / “main”):
+ *   Legacy: G = lobby, M/P = players. Compact (e.g. Kuruwumi main): B = lobby, E/H = players.
+ *   Set GOOGLE_GROUPS_LOBBY_COLUMN, GOOGLE_GROUPS_PLAYER1_COLUMN, GOOGLE_GROUPS_PLAYER2_COLUMN.
  */
 
 /**
@@ -77,17 +274,18 @@ async function findLobbyRow(sheets, spreadsheetId, sheetName, lobbyColumn, lobby
  *
  * Schedule's lobby column (D) holds sequential numbers, not lobby codes, so we
  * can't search it directly. Cross-reference via players (see layout comment):
- *   1. Find the lobby code in Sheet 2 col G → read players from M and P.
+ *   1. Find the lobby code on the main groups tab → read both players.
  *   2. Find the row in Sheet 1 Schedule where cols G and H contain those
  *      two players (in either order).
  *
  * @returns {Promise<{ scheduleRow: number, player1: string, player2: string, tabName: string|null }>}
  */
 async function findScheduleRowByLobbyCode(sheets, lobbyCode) {
-    const normalizedLobby = String(lobbyCode).trim().toUpperCase();
+    const want = normalizeMainLobbyKey(lobbyCode);
 
     const groupsSpreadsheetId = process.env.GOOGLE_GROUPS_SHEETS_ID || DEFAULT_GROUPS_SPREADSHEET_ID;
     const groupsTabName = process.env.GOOGLE_GROUPS_TAB_NAME || DEFAULT_GROUPS_TAB_NAME;
+    const groupsTabA1 = quoteSheetNameForA1(groupsTabName);
     const scheduleSpreadsheetId = process.env.GOOGLE_SHEETS_ID;
     const scheduleTabName = process.env.GOOGLE_SHEETS_TAB_NAME || "Schedule";
 
@@ -95,34 +293,67 @@ async function findScheduleRowByLobbyCode(sheets, lobbyCode) {
         throw new Error("GOOGLE_SHEETS_ID is not configured.");
     }
 
-    // Sheet 2 G:P → G=0, M=6, P=9.
+    const { minCol, maxCol, lobbyOff, p1Off, p2Off, p1, p2, lobby: lobbyColLet } = groupsMainPlayerCrossRefSlice();
+    const endRow = getGroupsMainScanEndRow();
+    const a1 = `${groupsTabA1}!${minCol}1:${maxCol}${endRow}`;
+
     const groupsResp = await sheets.spreadsheets.values.get({
         spreadsheetId: groupsSpreadsheetId,
-        range: `${groupsTabName}!G:P`,
+        range: a1,
     });
     const groupsRows = groupsResp.data.values || [];
-
     let player1 = null;
     let player2 = null;
-    for (const row of groupsRows) {
-        const code = String(row?.[0] || "").trim().toUpperCase();
-        if (code === normalizedLobby) {
-            player1 = String(row?.[6] || "").trim();
-            player2 = String(row?.[9] || "").trim();
+    for (let i = 0; i < groupsRows.length; i += 1) {
+        const row = groupsRows[i] || [];
+        const code = normalizeMainLobbyKey(row[lobbyOff] ?? "");
+        if (code && code === want) {
+            player1 = String(row[p1Off] ?? "").trim();
+            player2 = String(row[p2Off] ?? "").trim();
             break;
         }
     }
 
     if (!player1 || !player2) {
+        // Fallback: row-bounded single-column search + one row read (handles odd API edge cases)
+        const rowNum = await findLobbyRow(
+            sheets,
+            groupsSpreadsheetId,
+            groupsTabName,
+            lobbyColLet,
+            lobbyCode
+        );
+        if (rowNum !== -1) {
+            const one = await sheets.spreadsheets.values.get({
+                spreadsheetId: groupsSpreadsheetId,
+                range: `${groupsTabA1}!${minCol}${rowNum}:${maxCol}${rowNum}`,
+            });
+            const r = (one.data.values && one.data.values[0]) || [];
+            player1 = String(r[p1Off] ?? "").trim();
+            player2 = String(r[p2Off] ?? "").trim();
+        }
+    }
+
+    if (!player1 || !player2) {
+        const sample = [];
+        for (let i = 0; i < groupsRows.length && sample.length < 8; i += 1) {
+            const c = normalizeMainLobbyKey(groupsRows[i]?.[lobbyOff] ?? "");
+            if (c && /^[A-Z]\d+$/.test(c)) sample.push(c);
+        }
+        const sampleStr = sample.length ? ` (ex. col ${lobbyColLet}: ${sample.join(", ")})` : "";
         throw new Error(
-            `Lobby "${lobbyCode}" not found in "${groupsTabName}" (or players missing in cols M/P).`
+            `Lobby "${lobbyCode}" not found in "${groupsTabName}" (or players missing in cols ${p1}/${p2}).` +
+            ` Scanned ${minCol}1:${maxCol}${endRow} (${groupsRows.length} rows).` +
+            sampleStr
         );
     }
 
-    // Sheet 1 G:P → G=0, H=1, P=9 (tab name).
+    const matchTabCol = getScheduleMatchTabColumn();
+    const tabIdx = scheduleMatchTabIndexFromG();
+    // Sheet 1 G:Q (etc.) → G=0, H=1, … match tab name at GOOGLE_SHEETS_MATCH_TAB_COLUMN
     const scheduleResp = await sheets.spreadsheets.values.get({
         spreadsheetId: scheduleSpreadsheetId,
-        range: `${scheduleTabName}!G:P`,
+        range: `${scheduleTabName}!G:${matchTabCol}`,
     });
     const scheduleRows = scheduleResp.data.values || [];
 
@@ -133,7 +364,7 @@ async function findScheduleRowByLobbyCode(sheets, lobbyCode) {
         const matches =
             (g === player1 && h === player2) || (g === player2 && h === player1);
         if (matches) {
-            const tabName = String(row?.[9] || "").trim();
+            const tabName = String(row?.[tabIdx] || "").trim();
             return { scheduleRow: i + 1, player1, player2, tabName: tabName || null };
         }
     }
@@ -171,20 +402,25 @@ export async function syncScheduleIds() {
         throw new Error("GOOGLE_SHEETS_ID is not configured.");
     }
 
-    // Sheet 2: build (sorted-player-pair → lobby code) map.
+    const groupsTabA1 = quoteSheetNameForA1(groupsTabName);
+    const { minCol, maxCol, lobbyOff, p1Off, p2Off } = groupsMainPlayerCrossRefSlice();
+    const endRow = getGroupsMainScanEndRow();
+    const groupsRange = `${groupsTabA1}!${minCol}1:${maxCol}${endRow}`;
+
+    // Main groups: build (sorted-player-pair → lobby code) map.
     const groupsResp = await sheets.spreadsheets.values.get({
         spreadsheetId: groupsSpreadsheetId,
-        range: `${groupsTabName}!G:P`,
+        range: groupsRange,
     });
     const groupsRows = groupsResp.data.values || [];
 
     const pairKey = (a, b) => [a.trim(), b.trim()].sort().join("|");
     const lobbyByPair = new Map();
     for (const row of groupsRows) {
-        const code = String(row?.[0] || "").trim().toUpperCase();
+        const code = normalizeMainLobbyKey(row?.[lobbyOff] || "");
         if (!/^[A-Z]\d+$/.test(code)) continue;
-        const p1 = String(row?.[6] || "").trim();
-        const p2 = String(row?.[9] || "").trim();
+        const p1 = String(row?.[p1Off] || "").trim();
+        const p2 = String(row?.[p2Off] || "").trim();
         if (!p1 || !p2) continue;
         lobbyByPair.set(pairKey(p1, p2), code);
     }
@@ -243,6 +479,333 @@ export async function syncScheduleIds() {
     }
 
     return { matched, cleared, unmatched };
+}
+
+/**
+ * Writes Google Sheets formulas into the main groups tab columns **S** (MP) and **T** (VOD).
+ * Each row pulls URLs from the ref **Schedule** tab (`I` = lobby code, `O` = MP, `P` = VOD)
+ * by matching the main sheet **lobby** column (`GOOGLE_GROUPS_LOBBY_COLUMN`, default **G**) —
+ * same logic as `sheet-link-formulas.txt`.
+ *
+ * First time with IMPORTRANGE across files, open the sheet and approve access on any MP/VOD cell.
+ *
+ * Only rows whose **lobby** column (see `GOOGLE_GROUPS_LOBBY_COLUMN`, default **G**) looks like a lobby
+ * code (`A1`, `B2`, …) are updated so blank lobby cells (e.g. subheaders) are left untouched.
+ * Output columns default **S** / **T**; set `GOOGLE_GROUPS_MP_LINK_COLUMN` / `GOOGLE_GROUPS_VOD_LINK_COLUMN`
+ * if MP/VOD are elsewhere (e.g. **I** / **J** on the compact groups layout).
+ *
+ * @param {{ startRow?: number, rowCount?: number }} [opts]
+ * @returns {Promise<{ startRow: number, endRow: number, scannedRows: number, rowsWritten: number,
+ *   lobbyColumn: string, mpColumn: string, vodColumn: string }>}
+ */
+export async function applyGroupsSheetMpVodLinkFormulas(opts = {}) {
+    const sheets = getSheetsClient();
+    const groupsId = process.env.GOOGLE_GROUPS_SHEETS_ID || DEFAULT_GROUPS_SPREADSHEET_ID;
+    const groupsTab = process.env.GOOGLE_GROUPS_TAB_NAME || DEFAULT_GROUPS_TAB_NAME;
+    const groupsTabA1 = quoteSheetNameForA1(groupsTab);
+    const lobbyCol = String(process.env.GOOGLE_GROUPS_LOBBY_COLUMN || "G")
+        .replace(/\$/g, "")
+        .toUpperCase();
+    const mpCol = String(process.env.GOOGLE_GROUPS_MP_LINK_COLUMN || "S")
+        .replace(/\$/g, "")
+        .toUpperCase();
+    const vodCol = String(process.env.GOOGLE_GROUPS_VOD_LINK_COLUMN || "T")
+        .replace(/\$/g, "")
+        .toUpperCase();
+
+    const envStart = parseInt(process.env.GOOGLE_GROUPS_LINK_FORMULAS_START_ROW || "4", 10);
+    const envCount = parseInt(process.env.GOOGLE_GROUPS_LINK_FORMULAS_ROW_COUNT || "500", 10);
+    const startRow = Math.max(1, opts.startRow ?? envStart);
+    const rowCount = Math.min(3000, Math.max(1, opts.rowCount ?? envCount));
+    const endRow = startRow + rowCount - 1;
+
+    const gResp = await sheets.spreadsheets.values.get({
+        spreadsheetId: groupsId,
+        range: `${groupsTabA1}!${lobbyCol}${startRow}:${lobbyCol}${endRow}`,
+    });
+    const gRows = gResp.data.values || [];
+    const lobbyRe = /^[A-Z]\d+$/i;
+
+    const dataExpr = buildMpVodLetDataExpression();
+    const sep = getFormulaArgSeparator();
+    const updates = [];
+
+    for (let i = 0; i < gRows.length; i += 1) {
+        const r = startRow + i;
+        const gVal = String(gRows[i]?.[0] ?? "").trim();
+        if (!lobbyRe.test(gVal)) continue;
+
+        const fS = buildMpVodCellFormula(r, dataExpr, 7, sep, lobbyCol);
+        const fT = buildMpVodCellFormula(r, dataExpr, 8, sep, lobbyCol);
+        updates.push({ range: `${groupsTabA1}!${mpCol}${r}`, values: [[fS]] });
+        updates.push({ range: `${groupsTabA1}!${vodCol}${r}`, values: [[fT]] });
+    }
+
+    const chunkSize = 100;
+    for (let i = 0; i < updates.length; i += chunkSize) {
+        await sheets.spreadsheets.values.batchUpdate({
+            spreadsheetId: groupsId,
+            requestBody: {
+                valueInputOption: "USER_ENTERED",
+                data: updates.slice(i, i + chunkSize),
+            },
+        });
+    }
+
+    return {
+        startRow,
+        endRow,
+        scannedRows: rowCount,
+        rowsWritten: updates.length / 2,
+        lobbyColumn: lobbyCol,
+        mpColumn: mpCol,
+        vodColumn: vodCol,
+    };
+}
+
+/** Group colours for the ■ link text (A–D / E–H same pattern as your design). */
+const GROUP_SQUARE_COLOR_HEX = {
+    A: "df63fa",
+    B: "0048fc",
+    C: "fcab00",
+    D: "fcab00",
+    E: "df63fa",
+    F: "0048fc",
+    G: "fcab00",
+    H: "fcab00",
+};
+
+function hex6ToRgb01(hex6) {
+    const h = String(hex6).replace(/^#/, "");
+    if (h.length !== 6) return { red: 0, green: 0, blue: 0 };
+    return {
+        red: parseInt(h.slice(0, 2), 16) / 255,
+        green: parseInt(h.slice(2, 4), 16) / 255,
+        blue: parseInt(h.slice(4, 6), 16) / 255,
+    };
+}
+
+function rgbForLobbyCode(lobby) {
+    const c = String(lobby).trim().toUpperCase().charAt(0);
+    const hex = GROUP_SQUARE_COLOR_HEX[c] || GROUP_SQUARE_COLOR_HEX.A;
+    return hex6ToRgb01(hex);
+}
+
+function isPlausibleUrl(s) {
+    return /^https?:\/\//i.test(String(s ?? "").trim());
+}
+
+function escapeSheetFormulaString(s) {
+    return String(s).replace(/"/g, '""');
+}
+
+function hyperLinkSquareCellData(url, rgb) {
+    const sq = process.env.GOOGLE_GROUPS_SQUARE_CHAR || "\u25a0";
+    const f = `=HYPERLINK("${escapeSheetFormulaString(url)}","${escapeSheetFormulaString(sq)}")`;
+    return {
+        userEnteredValue: { formulaValue: f },
+        userEnteredFormat: {
+            textFormat: { foregroundColor: rgb, underline: false },
+        },
+    };
+}
+
+/** Clears content (removes a ■) when the ref has no URL. */
+function clearSquareCellData() {
+    return {
+        userEnteredValue: { stringValue: "" },
+        userEnteredFormat: {
+            textFormat: { underline: false },
+        },
+    };
+}
+
+function pairKeyForSchedule(a, b) {
+    return [String(a).trim(), String(b).trim()].sort().join("|");
+}
+
+/**
+ * Batched reads from ref Schedule: col I = lobby, O = MP, Q = VOD, plus G/H for
+ * name fallback when I doesn’t match.
+ */
+async function buildScheduleUrlLookup(sheets, scheduleId, schedTab, endRow) {
+    const idCol = normalizeColumnLetter(
+        process.env.GOOGLE_SHEETS_SCHEDULE_ID_COLUMN || process.env.GOOGLE_SHEETS_SCHEDULE_LOBBY_ID_COLUMN || "I"
+    );
+    const mpC = normalizeColumnLetter(process.env.GOOGLE_SHEETS_SCHEDULE_MP_COLUMN || "O");
+    const vodC = normalizeColumnLetter(process.env.GOOGLE_SHEETS_SCHEDULE_VOD_COLUMN || "Q");
+    const gCol = "G";
+    const hCol = "H";
+    const tab = quoteSheetNameForA1(schedTab);
+
+    const [idRes, mpRes, vodRes, gRes, hRes] = await Promise.all([
+        sheets.spreadsheets.values.get({ spreadsheetId: scheduleId, range: `${tab}!${idCol}1:${idCol}${endRow}` }),
+        sheets.spreadsheets.values.get({ spreadsheetId: scheduleId, range: `${tab}!${mpC}1:${mpC}${endRow}` }),
+        sheets.spreadsheets.values.get({ spreadsheetId: scheduleId, range: `${tab}!${vodC}1:${vodC}${endRow}` }),
+        sheets.spreadsheets.values.get({ spreadsheetId: scheduleId, range: `${tab}!${gCol}1:${gCol}${endRow}` }),
+        sheets.spreadsheets.values.get({ spreadsheetId: scheduleId, range: `${tab}!${hCol}1:${hCol}${endRow}` }),
+    ]);
+
+    const idRows = idRes.data.values || [];
+    const mpRows = mpRes.data.values || [];
+    const vodRows = vodRes.data.values || [];
+    const gRows = gRes.data.values || [];
+    const hRows = hRes.data.values || [];
+    const n = endRow;
+
+    const byLobby = new Map();
+    const byPair = new Map();
+    for (let i = 0; i < n; i += 1) {
+        const mp = String(mpRows[i]?.[0] ?? "").trim();
+        const vod = String(vodRows[i]?.[0] ?? "").trim();
+        const g = String(gRows[i]?.[0] ?? "").trim();
+        const h = String(hRows[i]?.[0] ?? "").trim();
+        if (g && h) {
+            byPair.set(pairKeyForSchedule(g, h), { mp, vod, row: i + 1 });
+        }
+        const idRaw = String(idRows[i]?.[0] ?? "");
+        const id = normalizeMainLobbyKey(idRaw);
+        if (id && /^[A-Z]\d+$/.test(id)) {
+            if (!byLobby.has(id)) byLobby.set(id, { mp, vod, row: i + 1 });
+        }
+    }
+    return { byLobby, byPair };
+}
+
+async function getGridSheetIdByName(sheets, spreadsheetId, title) {
+    const res = await sheets.spreadsheets.get({
+        spreadsheetId,
+        fields: "sheets.properties",
+    });
+    const tab = res.data.sheets?.find((s) => s.properties?.title === title);
+    if (tab?.properties?.sheetId == null) {
+        throw new Error(`No sheet tab named "${title}" in this spreadsheet.`);
+    }
+    return tab.properties.sheetId;
+}
+
+/**
+ * Main tab S/T (or env): set `=HYPERLINK(…,"■")` with your group text colours (no
+ * underline) from ref Schedule O/Q. Clears a cell if the URL in ref is empty (removes
+ * a ■ with no VOD/MP). Cross-refs by Schedule **I** first, then G/H + main E/H.
+ */
+export async function applyGroupsMpVodSquareHyperlinksFromSchedule(opts = {}) {
+    const sheets = getSheetsClient();
+    const groupsId = process.env.GOOGLE_GROUPS_SHEETS_ID || DEFAULT_GROUPS_SPREADSHEET_ID;
+    const mainTab = process.env.GOOGLE_GROUPS_TAB_NAME || DEFAULT_GROUPS_TAB_NAME;
+    const scheduleId = process.env.GOOGLE_SHEETS_ID;
+    const schedTab = process.env.GOOGLE_SHEETS_TAB_NAME || "Schedule";
+    if (!scheduleId) {
+        throw new Error("GOOGLE_SHEETS_ID is not configured (ref / Schedule spreadsheet).");
+    }
+
+    const mpTgt = normalizeColumnLetter(
+        process.env.GOOGLE_GROUPS_SQUARE_MP_COLUMN || process.env.GOOGLE_SQUARE_MP_COLUMN || "S"
+    );
+    const vodTgt = normalizeColumnLetter(
+        process.env.GOOGLE_GROUPS_SQUARE_VOD_COLUMN || process.env.GOOGLE_SQUARE_VOD_COLUMN || "T"
+    );
+    if (mpTgt === vodTgt) {
+        throw new Error("MP and VOD square columns must differ (default S and T).");
+    }
+
+    const { minCol, maxCol, lobbyOff, p1Off, p2Off } = groupsMainPlayerCrossRefSlice();
+    const endMain = getGroupsMainScanEndRow();
+    const envStart = parseInt(process.env.GOOGLE_GROUPS_LINK_FORMULAS_START_ROW || "4", 10);
+    const envCount = parseInt(process.env.GOOGLE_GROUPS_LINK_FORMULAS_ROW_COUNT || "500", 10);
+    const startRow = Math.max(1, opts.startRow ?? envStart);
+    const rowCount = Math.min(3000, Math.max(1, opts.rowCount ?? envCount));
+    const endRow = startRow + rowCount - 1;
+
+    const mainTabA1 = quoteSheetNameForA1(mainTab);
+    const mainA1 = `${mainTabA1}!${minCol}1:${maxCol}${endMain}`;
+    const mainRes = await sheets.spreadsheets.values.get({
+        spreadsheetId: groupsId,
+        range: mainA1,
+    });
+    const mainRows = mainRes.data.values || [];
+    const lobbyRe = /^[A-Z]\d+$/i;
+
+    const { byLobby, byPair } = await buildScheduleUrlLookup(
+        sheets,
+        scheduleId,
+        schedTab,
+        endMain
+    );
+
+    const sheetId = await getGridSheetIdByName(sheets, groupsId, mainTab);
+    const tMp = columnLettersToIndex0(mpTgt);
+    const tVod = columnLettersToIndex0(vodTgt);
+    if (tVod - tMp !== 1) {
+        throw new Error("Set GOOGLE_GROUPS_SQUARE_MP_COLUMN and ..._VOD_COLUMN to adjacent columns (e.g. S, T) with VOD immediately to the right of MP.");
+    }
+    const startCol = tMp;
+    const endColEx = tVod + 1;
+
+    const requests = [];
+    let hyperlinksSet = 0;
+    let cellsCleared = 0;
+
+    const pushRow = (row0, rowData) => {
+        requests.push({
+            updateCells: {
+                range: {
+                    sheetId,
+                    startRowIndex: row0,
+                    endRowIndex: row0 + 1,
+                    startColumnIndex: startCol,
+                    endColumnIndex: endColEx,
+                },
+                rows: [rowData],
+                fields: "userEnteredValue,userEnteredFormat.textFormat",
+            },
+        });
+    };
+
+    for (let i = startRow - 1; i < endRow && i < mainRows.length; i += 1) {
+        const row = mainRows[i] || [];
+        const lobby = normalizeMainLobbyKey(row[lobbyOff] ?? "");
+        if (!lobbyRe.test(lobby)) continue;
+
+        const p1 = String(row[p1Off] ?? "").trim();
+        const p2 = String(row[p2Off] ?? "").trim();
+        const rgb = rgbForLobbyCode(lobby);
+        const sheetRow0 = i;
+
+        let src = byLobby.get(lobby);
+        if (!src && p1 && p2) {
+            src = byPair.get(pairKeyForSchedule(p1, p2));
+        }
+        if (!src) {
+            continue;
+        }
+        const mpUrl = isPlausibleUrl(src.mp) ? String(src.mp).trim() : "";
+        const vodUrl = isPlausibleUrl(src.vod) ? String(src.vod).trim() : "";
+        const cMp = mpUrl ? hyperLinkSquareCellData(mpUrl, rgb) : clearSquareCellData();
+        const cVod = vodUrl ? hyperLinkSquareCellData(vodUrl, rgb) : clearSquareCellData();
+        if (mpUrl) hyperlinksSet += 1;
+        else cellsCleared += 1;
+        if (vodUrl) hyperlinksSet += 1;
+        else cellsCleared += 1;
+        pushRow(sheetRow0, { values: [cMp, cVod] });
+    }
+
+    for (let i = 0; i < requests.length; i += 40) {
+        await sheets.spreadsheets.batchUpdate({
+            spreadsheetId: groupsId,
+            requestBody: { requests: requests.slice(i, i + 40) },
+        });
+    }
+
+    return {
+        startRow,
+        endRow,
+        requestCount: requests.length,
+        hyperlinksSet,
+        cellsCleared,
+        squareMpColumn: mpTgt,
+        squareVodColumn: vodTgt,
+    };
 }
 
 /**
@@ -343,18 +906,18 @@ export async function updateLobbyReferee(lobbyCode, refereeValue) {
 /**
  * Reads all lobby scores from the Schedule tab.
  * Returns a Map of lobbyCode → { score1, score2, tabName }.
- * Schedule layout (from col D): D=lobby, M=score1, N=score2, P=tabName
+ * Schedule layout (from col D): D=lobby, M=score1, N=score2, Q=tabName (configurable)
  */
 async function readAllScheduleScores(sheets, spreadsheetId, sheetName, lobbyColumn) {
+    const matchTabCol = getScheduleMatchTabColumn();
     const response = await sheets.spreadsheets.values.get({
         spreadsheetId,
-        range: `${sheetName}!D:P`,
+        range: `${sheetName}!D:${matchTabCol}`,
     });
     const rows = response.data.values || [];
-    const colD = "D".charCodeAt(0) - "A".charCodeAt(0); // 3
     const colM = "M".charCodeAt(0) - "D".charCodeAt(0); // 9
     const colN = "N".charCodeAt(0) - "D".charCodeAt(0); // 10
-    const colP = "P".charCodeAt(0) - "D".charCodeAt(0); // 12
+    const colTab = scheduleMatchTabIndexFromD();
 
     const scoreMap = new Map();
     for (const row of rows) {
@@ -363,7 +926,7 @@ async function readAllScheduleScores(sheets, spreadsheetId, sheetName, lobbyColu
         scoreMap.set(lobby, {
             score1: Number(row[colM]) || 0,
             score2: Number(row[colN]) || 0,
-            tabName: String(row[colP] || "").trim(),
+            tabName: String(row[colTab] || "").trim(),
         });
     }
     return scoreMap;
@@ -389,7 +952,9 @@ export async function updateLobbySeriesScore(lobbyCode, redScore, blueScore) {
     const { tabName } = await findScheduleRowByLobbyCode(sheets, lobbyCode);
 
     if (!tabName) {
-        throw new Error(`Lobby "${lobbyCode}" has no match tab assigned (column P is empty on Schedule).`);
+        throw new Error(
+            `Lobby "${lobbyCode}" has no match tab assigned (${getScheduleMatchTabColumn()} is empty on Schedule).`
+        );
     }
 
     await sheets.spreadsheets.values.batchUpdate({
